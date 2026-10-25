@@ -48,6 +48,91 @@ export function filterModelIds(ids: string[], query: string): string[] {
   });
 }
 
+export const PICKER_POPUP_MIN_COLUMNS = 60;
+export const PICKER_POPUP_MIN_ROWS = 18;
+export const PICKER_POPUP_MAX_WIDTH = 76;
+export const PICKER_POPUP_MAX_HEIGHT = 16;
+/** Rows the inline picker reserves below the transcript. */
+export const PICKER_INLINE_ROWS = 13;
+
+export interface PickerPopupRect {
+  top: number;
+  left: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Centers a fixed picker frame over the app's content area, keeping the input
+ * and status rows clear. Returns null when the terminal is too small to overlay.
+ */
+export function pickerPopupRect(columns: number, rows: number): PickerPopupRect | null {
+  if (columns < PICKER_POPUP_MIN_COLUMNS || rows < PICKER_POPUP_MIN_ROWS) return null;
+  const width = Math.min(PICKER_POPUP_MAX_WIDTH, columns - 8);
+  const height = Math.min(PICKER_POPUP_MAX_HEIGHT, rows - 6);
+  // The transcript takes rows - 5, then the input and status rows.
+  const contentRows = rows - 3;
+  return {
+    top: Math.max(0, Math.floor((contentRows - height) / 2)),
+    // The app root adds one column of horizontal padding.
+    left: Math.max(0, Math.floor((columns - width) / 2) - 1),
+    width,
+    height,
+  };
+}
+
+/** Room for the list once the frame chrome and any hint/error rows are drawn. */
+export function pickerPopupRows(height: number, extraRows = 0): number {
+  return Math.max(2, height - 6 - Math.max(0, extraRows));
+}
+
+export interface PickerRange {
+  above: number;
+  below: number;
+  first: number;
+  last: number;
+  total: number;
+}
+
+/** Visible selectable window plus how many entries are hidden on each side. */
+export function pickerRange(start: number, end: number, total: number): PickerRange {
+  const from = Math.max(0, Math.min(start, total));
+  const to = Math.max(from, Math.min(end, total));
+  return {
+    above: from,
+    below: total - to,
+    first: total === 0 ? 0 : from + 1,
+    last: to,
+    total,
+  };
+}
+
+/** Same range, counting profiles while skipping endpoint headers. */
+export function profileRange(rows: PickerRow[], start: number, end: number): PickerRange {
+  const lines = selectableLines(rows);
+  const above = lines.filter((line) => line < start).length;
+  const visible = lines.filter((line) => line >= start && line < end).length;
+  return {
+    above,
+    below: lines.length - above - visible,
+    first: visible === 0 ? 0 : above + 1,
+    last: above + visible,
+    total: lines.length,
+  };
+}
+
+export function pickerRangeLabel(range: PickerRange): string {
+  const window =
+    range.first === 0 || range.total === 0
+      ? `0 of ${range.total}`
+      : `${range.first}-${range.last} of ${range.total}`;
+  const parts: string[] = [];
+  if (range.above > 0) parts.push(`↑ ${range.above} more`);
+  parts.push(window);
+  if (range.below > 0) parts.push(`↓ ${range.below} more`);
+  return parts.join(' · ');
+}
+
 /** Keeps the highlighted line inside a window of `maxRows` entries. */
 export function pickerWindow(
   index: number,

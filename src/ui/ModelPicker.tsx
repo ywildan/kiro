@@ -4,7 +4,11 @@ import type { KiroConfig } from '../config.js';
 import {
   filterModelIds,
   modelIds,
+  pickerPopupRows,
+  pickerRange,
+  pickerRangeLabel,
   pickerWindow,
+  profileRange,
   profileRows,
   selectableLines,
   selectableNames,
@@ -21,6 +25,8 @@ interface ModelPickerProps {
   activeProfile: string;
   width: number;
   maxRows?: number;
+  /** Fixed frame height for the centered overlay; the footer is pushed down. */
+  height?: number;
   onSelect(profile: string, model: string): void;
   onRefresh(profile: string): Promise<ModelRefreshResult>;
   onCancel(): void;
@@ -48,6 +54,7 @@ export function ModelPicker({
   activeProfile,
   width,
   maxRows = 8,
+  height,
   onSelect,
   onRefresh,
   onCancel,
@@ -68,7 +75,20 @@ export function ModelPicker({
   const selected = Math.min(index, Math.max(0, count - 1));
   const selectedLine = step.kind === 'profile' ? (lines[selected] ?? 0) : selected;
   const total = step.kind === 'profile' ? rows.length : models.length;
-  const { start, end } = pickerWindow(selectedLine, total, maxRows);
+  const popup = height !== undefined;
+  const hintRows =
+    (step.kind === 'model' && models.length === 0 ? 1 : 0) +
+    (step.kind === 'model' && profile !== undefined && !profile.models?.length ? 1 : 0) +
+    (error ? 1 : 0);
+  const listRows = popup ? pickerPopupRows(height, hintRows) : maxRows;
+  const { start, end } = pickerWindow(selectedLine, total, listRows);
+  const range = popup
+    ? step.kind === 'model'
+      ? pickerRange(start, end, total)
+      : profileRange(rows, start, end)
+    : null;
+  // The opaque frame needs an explicit foreground even on light terminal themes.
+  const base = popup ? 'white' : undefined;
 
   const refresh = async (name: string): Promise<void> => {
     setRefreshing(true);
@@ -149,16 +169,19 @@ export function ModelPicker({
     <Box
       flexDirection="column"
       width={width}
+      height={height}
       borderStyle="round"
       borderColor="cyan"
       paddingX={1}
       flexShrink={0}
+      backgroundColor={popup ? 'black' : undefined}
+      overflow={height === undefined ? undefined : 'hidden'}
     >
       <Text bold color="cyan" wrap="truncate-end">
         {title}
       </Text>
       {step.kind === 'model' ? (
-        <Text wrap="truncate-end">
+        <Text color={base} wrap="truncate-end">
           <Said>Search: </Said>
           {query || <Said>type to filter</Said>}
         </Text>
@@ -168,7 +191,7 @@ export function ModelPicker({
             const line = start + offset;
             if (row.kind === 'header') {
               return (
-                <Text key={`h${line}`} dimColor wrap="truncate-end">
+                <Text key={`h${line}`} dimColor color={base} wrap="truncate-end">
                   {row.text}
                 </Text>
               );
@@ -177,7 +200,7 @@ export function ModelPicker({
             return (
               <Text
                 key={`p${line}`}
-                color={focused ? 'cyan' : undefined}
+                color={focused ? 'cyan' : base}
                 bold={focused}
                 wrap="truncate-end"
               >
@@ -191,7 +214,7 @@ export function ModelPicker({
             return (
               <Text
                 key={`m${line}`}
-                color={focused ? 'cyan' : undefined}
+                color={focused ? 'cyan' : base}
                 bold={focused}
                 wrap="truncate-end"
               >
@@ -200,12 +223,12 @@ export function ModelPicker({
             );
           })}
       {step.kind === 'model' && models.length === 0 ? (
-        <Text dimColor wrap="truncate-end">
+        <Text dimColor color={base} wrap="truncate-end">
           No models match &quot;{query}&quot;. Backspace to edit, Esc to clear.
         </Text>
       ) : null}
       {step.kind === 'model' && profile && !profile.models?.length ? (
-        <Text wrap="truncate-end">
+        <Text color={base} wrap="truncate-end">
           <Said>Only the active model is stored; press </Said>
           <Key>Ctrl+R</Key>
           <Said> to fetch this endpoint.</Said>
@@ -216,8 +239,14 @@ export function ModelPicker({
           {error}
         </Text>
       ) : null}
+      {range ? (
+        <Text dimColor color={base} wrap="truncate-end">
+          {pickerRangeLabel(range)}
+        </Text>
+      ) : null}
+      {height === undefined ? null : <Box flexGrow={1} />}
       {step.kind === 'profile' ? (
-        <Text wrap="truncate-end">
+        <Text color={base} wrap="truncate-end">
           <Key>↑/↓</Key>
           <Said> move · </Said>
           <Key>Enter</Key>
@@ -226,11 +255,11 @@ export function ModelPicker({
           <Said> close</Said>
         </Text>
       ) : refreshing ? (
-        <Text dimColor wrap="truncate-end">
+        <Text dimColor color={base} wrap="truncate-end">
           Fetching models…
         </Text>
       ) : (
-        <Text wrap="truncate-end">
+        <Text color={base} wrap="truncate-end">
           <Key>↑/↓</Key>
           <Said> move · </Said>
           <Key>Enter</Key>

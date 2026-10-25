@@ -93,13 +93,19 @@ import { applyPalette, buildLines, buildPaletteLines } from '../src/ui/MessageLi
 import {
   filterModelIds,
   modelIds,
+  pickerPopupRect,
+  pickerPopupRows,
+  pickerRange,
+  pickerRangeLabel,
   pickerWindow,
+  profileRange,
   profileRows,
   selectableLines,
   selectableNames,
   withProfileModel,
   withProfileModels,
 } from '../src/ui/model-picker.js';
+import { ModelPicker } from '../src/ui/ModelPicker.js';
 import { formatProfileList } from '../src/ui/profile-list.js';
 import {
   SLASH_COMMANDS,
@@ -2092,6 +2098,102 @@ async function main(): Promise<void> {
       completionTokens: 0,
       requests: 0,
     });
+  });
+
+  await test('the model picker popup is centered and never shrinks the transcript', () => {
+    assert.equal(pickerPopupRect(59, 30), null, 'narrow terminals fall back inline');
+    assert.equal(pickerPopupRect(120, 17), null, 'short terminals fall back inline');
+
+    const wide = pickerPopupRect(120, 30);
+    assert.ok(wide);
+    assert.deepEqual(wide, { top: 5, left: 21, width: 76, height: 16 });
+    assert.equal(wide.left + 1, 120 - (wide.left + 1 + wide.width), 'centered in the padded root');
+    assert.ok(wide.top + wide.height <= 30 - 5, 'stays above the input row');
+    assert.deepEqual(pickerPopupRect(80, 24), { top: 2, left: 3, width: 72, height: 16 });
+    assert.deepEqual(pickerPopupRect(60, 18), { top: 1, left: 3, width: 52, height: 12 });
+    assert.equal(pickerPopupRows(16), 10, 'the list fills the fixed frame');
+    assert.equal(pickerPopupRows(12), 6);
+    assert.equal(pickerPopupRows(8), 2);
+    assert.equal(pickerPopupRows(16, 2), 8, 'hints and errors take list rows');
+    assert.equal(pickerPopupRows(12, 3), 3);
+
+    assert.deepEqual(pickerRange(0, 10, 30), {
+      above: 0,
+      below: 20,
+      first: 1,
+      last: 10,
+      total: 30,
+    });
+    assert.equal(pickerRangeLabel(pickerRange(0, 10, 30)), '1-10 of 30 · ↓ 20 more');
+    assert.equal(
+      pickerRangeLabel(pickerRange(5, 15, 30)),
+      '↑ 5 more · 6-15 of 30 · ↓ 15 more',
+    );
+    assert.equal(pickerRangeLabel(pickerRange(20, 30, 30)), '↑ 20 more · 21-30 of 30');
+    assert.equal(pickerRangeLabel(pickerRange(0, 0, 0)), '0 of 0');
+
+    const config: KiroConfig = {
+      activeProfile: 'mock',
+      profiles: {
+        mock: {
+          type: 'openai',
+          baseUrl: 'http://127.0.0.1:9/v1',
+          model: 'mock-model',
+        },
+      },
+    };
+    const rendered = renderToString(
+      React.createElement(ModelPicker, {
+        config,
+        activeProfile: 'mock',
+        width: 76,
+        height: 16,
+        onSelect: () => {},
+        onRefresh: async () => ({ ok: true }),
+        onCancel: () => {},
+      }),
+      { columns: 120 },
+    ).trimEnd();
+    const lines = rendered.split('\n');
+    assert.equal(lines.length, 16, 'the dialog keeps a fixed frame');
+    for (const line of lines) {
+      assert.ok(displayWidth(line) <= 76, `popup line fits: ${line}`);
+    }
+    assert.match(rendered, /Model · 1 profile/);
+    assert.match(rendered, /1-1 of 1/);
+    assert.match(rendered, /Esc close/);
+
+    const profiles: KiroConfig['profiles'] = {};
+    for (let i = 1; i <= 15; i++) {
+      profiles[`p${i}`] = {
+        type: 'openai',
+        baseUrl: 'http://localhost/v1',
+        model: `model-${i}`,
+      };
+    }
+    const many: KiroConfig = { activeProfile: 'p1', profiles };
+    const rowsPage = profileRows(many);
+    const window = pickerWindow(selectableLines(rowsPage)[0] ?? 0, rowsPage.length, 10);
+    assert.equal(
+      pickerRangeLabel(profileRange(rowsPage, window.start, window.end)),
+      '1-9 of 15 · ↓ 6 more',
+    );
+
+    const crowded = renderToString(
+      React.createElement(ModelPicker, {
+        config: many,
+        activeProfile: 'p1',
+        width: 76,
+        height: 16,
+        onSelect: () => {},
+        onRefresh: async () => ({ ok: true }),
+        onCancel: () => {},
+      }),
+      { columns: 120 },
+    ).trimEnd();
+    assert.equal(crowded.split('\n').length, 16);
+    assert.match(crowded, /1-9 of 15/);
+    assert.match(crowded, /↓ 6 more/);
   });
 
   await test('middle truncation fits the budget and keeps both ends', async () => {

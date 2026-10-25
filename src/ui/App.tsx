@@ -54,7 +54,12 @@ import { Input } from './Input.js';
 import { MessageList } from './MessageList.js';
 import { MOUSE_OFF, MOUSE_ON } from './mouse.js';
 import { ModelPicker, type ModelRefreshResult } from './ModelPicker.js';
-import { withProfileModel, withProfileModels } from './model-picker.js';
+import {
+  PICKER_INLINE_ROWS,
+  pickerPopupRect,
+  withProfileModel,
+  withProfileModels,
+} from './model-picker.js';
 import { formatProfileList } from './profile-list.js';
 import { loadPromptHistory, recordPrompt } from './prompt-history.js';
 import { StatusBar, type Activity } from './StatusBar.js';
@@ -1499,9 +1504,12 @@ export function App({
         : null;
   const activeProfile = runtimeConfig.profiles[profileName];
   const contextWindow = contextWindowFor(activeProfile);
+  const pickerPopup =
+    pickerOpen && !pendingApproval ? pickerPopupRect(columns, rows) : null;
+  const pickerInline = pickerOpen && !pendingApproval && pickerPopup === null;
   const viewportHeight = Math.max(
     3,
-    rows - 5 - (pendingApproval ? 12 : 0) - (pickerOpen ? 13 : 0),
+    rows - 5 - (pendingApproval ? 12 : 0) - (pickerInline ? PICKER_INLINE_ROWS : 0),
   );
   const showUsageCard = usageCardEnabled && shouldShowUsageCard(columns, viewportHeight);
   const chatWidth = showUsageCard ? Math.max(40, width - USAGE_CARD_WIDTH - USAGE_CARD_GAP) : width;
@@ -1537,7 +1545,7 @@ export function App({
           width={width}
           onDecision={resolveApproval}
         />
-      ) : pickerOpen ? (
+      ) : pickerInline ? (
         <ModelPicker
           config={runtimeConfig}
           activeProfile={profileName}
@@ -1549,22 +1557,24 @@ export function App({
       ) : (
         <Input
           key={wizardPrompt?.id ?? 0}
-          disabled={false}
+          disabled={pickerOpen}
           width={width}
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
           history={wizardPrompt || wizardActive ? undefined : promptHistory}
           onPaletteChange={setPalette}
           placeholder={
-            wizardPrompt
-              ? wizardPrompt.defaultValue && !wizardPrompt.mask
-                ? `${wizardPrompt.label} [${wizardPrompt.defaultValue}]`
-                : wizardPrompt.label
-              : busy
-                ? 'Kiro is working… type ahead, or Ctrl+C to cancel'
-                : wizardActive
-                  ? 'Working… Esc to cancel'
-                  : 'Ask Kiro to build or change something…'
+            pickerOpen
+              ? 'Model picker open · Esc to close'
+              : wizardPrompt
+                ? wizardPrompt.defaultValue && !wizardPrompt.mask
+                  ? `${wizardPrompt.label} [${wizardPrompt.defaultValue}]`
+                  : wizardPrompt.label
+                : busy
+                  ? 'Kiro is working… type ahead, or Ctrl+C to cancel'
+                  : wizardActive
+                    ? 'Working… Esc to cancel'
+                    : 'Ask Kiro to build or change something…'
           }
           slashMenu={!wizardActive && !wizardPrompt}
           onSubmit={handleSubmit}
@@ -1585,6 +1595,19 @@ export function App({
         contextTokens={showUsageCard ? undefined : contextTokens}
         contextWindow={showUsageCard ? undefined : contextWindow}
       />
+      {pickerOpen && pickerPopup ? (
+        <Box position="absolute" marginTop={pickerPopup.top} marginLeft={pickerPopup.left}>
+          <ModelPicker
+            config={runtimeConfig}
+            activeProfile={profileName}
+            width={pickerPopup.width}
+            height={pickerPopup.height}
+            onSelect={(name, model) => void selectModel(name, model)}
+            onRefresh={refreshProfileModels}
+            onCancel={() => setPickerOpen(false)}
+          />
+        </Box>
+      ) : null}
     </Box>
   );
 }
