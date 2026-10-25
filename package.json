@@ -1,0 +1,38 @@
+{
+  "name": "kiro",
+  "version": "0.1.0",
+  "description": "A small terminal coding agent with your own OpenAI-compatible endpoint",
+  "type": "module",
+  "bin": {
+    "kiro": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.tsx",
+    "test": "tsx test/e2e.ts",
+    "mock": "tsx test/mock-server.ts",
+    "prepublishOnly": "pnpm build"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "ink": "^6.8.0",
+    "react": "^19.3.1",
+    "string-width": "^8.3.0",
+    "wrap-ansi": "^10.0.2"
+  },
+  "devDependencies": {
+    "@types/diff": "^8.0.0",
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,110 @@
+import React, { useEffect, useState } from 'react';
+import { Box, Text } from 'ink';
+import { homedir } from 'node:os';
+import { formatTokens } from '../agent/tokens.js';
+import { displayWidth, truncateMiddle, truncateToWidth } from './text.js';
+
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+export type Activity = 'thinking' | 'running' | 'cancelling' | 'approval' | null;
+
+interface StatusBarProps {
+  width: number;
+  profile: string;
+  model: string;
+  cwd: string;
+  activity: Activity;
+  toolName?: string;
+  yolo?: boolean;
+  autoAllowed?: string[];
+  contextTokens?: number;
+  contextWindow?: number;
+}
+
+function prettyCwd(cwd: string): string {
+  const home = homedir();
+  if (cwd === home) return '~';
+  if (cwd.startsWith(home + '/') || cwd.startsWith(home + '\\')) {
+    return `~${cwd.slice(home.length)}`;
+  }
+  return cwd;
+}
+
+export function StatusBar({
+  width,
+  profile,
+  model,
+  cwd,
+  activity,
+  toolName,
+  yolo = false,
+  autoAllowed = [],
+  contextTokens,
+  contextWindow,
+}: StatusBarProps): React.JSX.Element {
+  const busy = activity !== null;
+  const [frame, setFrame] = useState(0);
+
+  useEffect(() => {
+    if (!busy) return;
+    const interval = setInterval(() => setFrame((current) => (current + 1) % SPINNER.length), 100);
+    return () => clearInterval(interval);
+  }, [busy]);
+
+  const stateText =
+    activity === 'approval'
+      ? 'approval needed'
+      : activity === 'cancelling'
+        ? 'cancelling…'
+        : activity === 'running'
+          ? `running ${toolName ?? 'tool'}…`
+          : activity === 'thinking'
+            ? 'thinking…'
+            : 'ready';
+  const stateColor =
+    activity === 'cancelling' ? 'red' : activity === null ? 'green' : 'yellow';
+  const spinner = busy ? `${SPINNER[frame] ?? '⠋'} ` : '';
+  const badge = yolo
+    ? 'YOLO'
+    : autoAllowed.length > 0
+      ? `auto:${autoAllowed.join(',')}`
+      : '';
+  const badgeWidth = badge === '' ? 0 : displayWidth(badge) + 2;
+  const state = `${spinner}${stateText}`;
+  const stateBudget = Math.max(4, Math.max(10, Math.floor(width / 2)) - badgeWidth);
+  const stateShown = truncateToWidth(state, stateBudget);
+  const restBudget = Math.max(0, width - badgeWidth - displayWidth(stateShown) - 2 - 6);
+  const context =
+    contextTokens !== undefined && contextWindow !== undefined
+      ? ` · ctx ${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`
+      : '';
+  const tail = ` · ${model} · ${prettyCwd(cwd)}${context}`;
+  const tailWidth = displayWidth(tail);
+  const rest =
+    restBudget <= 0
+      ? ''
+      : displayWidth(profile) + tailWidth <= restBudget
+        ? `${profile}${tail}`
+        : restBudget >= tailWidth + 4
+          ? `${truncateMiddle(profile, restBudget - tailWidth)}${tail}`
+          : truncateMiddle(`${profile}${tail}`, restBudget);
+
+  return (
+    <Box width={width} flexShrink={0} justifyContent="space-between">
+      <Text wrap="truncate-end">
+        <Text color="cyan" bold>
+          Kiro
+        </Text>
+        {rest ? <Text dimColor>{`  ${rest}`}</Text> : null}
+      </Text>
+      <Text wrap="truncate-end">
+        {badge === '' ? null : (
+          <Text bold color={yolo ? 'red' : 'magenta'}>
+            {badge}
+          </Text>
+        )}
+        <Text color={stateColor}>{badge === '' ? stateShown : `  ${stateShown}`}</Text>
+      </Text>
+    </Box>
+  );
+}
