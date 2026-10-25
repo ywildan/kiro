@@ -129,6 +129,15 @@ Key handling for `kiro model add`:
 - `--api-key-env <VAR>` with no key stores nothing; it references the variable, which must already be set in the environment or in `~/.kiro/.env`.
 - Omitting both creates a profile with no key, suitable for local servers.
 
+### Staying up to date
+
+```bash
+kiro check                            # installed version vs the latest on npm
+kiro update                           # npm install -g @ywldan/kiro@latest
+```
+
+`check` exits `0` when current, `1` when an update is available, `2` when the registry cannot be reached. `update` shows the npm output and needs the same permissions as a global npm install.
+
 ### Where keys live
 
 The config file contains only `apiKeyEnv`, the *name* of a variable. Values live in the environment or in `~/.kiro/.env`:
@@ -241,6 +250,9 @@ kiro [options]
   --no-alt-screen    Do not switch to the terminal's alternate screen
   -h, --help         Show help
   -v, --version      Show version
+
+  kiro check         Compare the installed version with the latest on npm
+  kiro update        Install the latest version from npm globally
 ```
 
 `--flag=value` works as well. CLI overrides last for the current process only.

@@ -18,6 +18,7 @@ import { registerSecretEnv } from './secrets.js';
 import { latestSession, loadSession, type SessionRecord } from './sessions.js';
 import { MOUSE_OFF } from './ui/mouse.js';
 import { App, type StartupNotice } from './ui/App.js';
+import { runCheck, runUpdate } from './update.js';
 import { VERSION } from './version.js';
 
 interface CliOptions {
@@ -64,6 +65,10 @@ Model commands:
   kiro model use <n> Make a profile active
   kiro model remove <n>
   kiro model test [n]
+
+Update commands:
+  kiro check         Compare the installed version with the latest on npm
+  kiro update        Install the latest version from npm globally
 
 Config: ~/.kiro/config.json (created with a template on first run)
 Keys: ~/.kiro/.env (mode 0600), or the environment variable named by "apiKeyEnv".
@@ -200,6 +205,14 @@ async function main(): Promise<void> {
   const rawArgs = process.argv.slice(2);
   if (rawArgs[0] === 'model') {
     process.exitCode = await runModelCli(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'check') {
+    process.exitCode = await runCheck();
+    return;
+  }
+  if (rawArgs[0] === 'update') {
+    process.exitCode = await runUpdate();
     return;
   }
 
