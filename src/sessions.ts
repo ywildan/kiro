@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { ChatMessage, ToolCall } from './providers/types.js';
+import { normalizeUsage, type UsageTotals } from './usage.js';
 
 export const SESSION_VERSION = 1;
 
@@ -16,6 +17,8 @@ export interface SessionRecord {
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
+  /** Endpoint-reported token totals for the whole session. */
+  usage?: UsageTotals;
 }
 
 export interface SessionSummary {
@@ -36,6 +39,7 @@ export interface SaveSessionInput {
   title?: string;
   createdAt?: string;
   messages: ChatMessage[];
+  usage?: UsageTotals;
 }
 
 export interface SessionListResult {
@@ -184,6 +188,7 @@ export async function saveSession(input: SaveSessionInput): Promise<SessionRecor
     createdAt: input.createdAt ?? now,
     updatedAt: now,
     messages,
+    usage: normalizeUsage(input.usage),
   };
 
   const dir = projectSessionsDir(input.cwd);
@@ -246,6 +251,7 @@ export async function loadSession(cwd: string, id: string): Promise<SessionRecor
     createdAt,
     updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : createdAt,
     messages,
+    usage: normalizeUsage(parsed.usage),
   };
 }
 

@@ -366,7 +366,14 @@ export function MessageList({
   const shown = applyPalette(visible, palette, width, height);
 
   return (
-    <Box flexDirection="column" height={height} overflowY="hidden" flexShrink={0} justifyContent="flex-end">
+    <Box
+      flexDirection="column"
+      width={width}
+      height={height}
+      overflowY="hidden"
+      flexShrink={0}
+      justifyContent="flex-end"
+    >
       {shown.map((line, index) => {
         const hasSuffix = line.suffix !== undefined;
         return (

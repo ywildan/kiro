@@ -265,6 +265,142 @@ function quoteLines(text: string, width: number): MarkdownLine[] {
   }));
 }
 
+type ColumnAlign = 'left' | 'center' | 'right';
+
+const MIN_TABLE_COLUMN = 4;
+
+function segmentWidth(segments: MarkdownSegment[]): number {
+  return displayWidth(segments.map((segment) => segment.text).join(''));
+}
+
+/** Splits a table row on pipes that are not escaped or inside inline code. */
+function splitTableRow(raw: string): string[] {
+  let text = raw.trim();
+  if (text.startsWith('|')) text = text.slice(1);
+  if (text.endsWith('|') && !text.endsWith('\\|')) text = text.slice(0, -1);
+  const cells: string[] = [];
+  let cell = '';
+  let inCode = false;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]!;
+    if (char === '\\' && text[index + 1] === '|') {
+      cell += '\\|';
+      index++;
+      continue;
+    }
+    if (char === '`') {
+      inCode = !inCode;
+      cell += char;
+      continue;
+    }
+    if (char === '|' && !inCode) {
+      cells.push(cell.trim());
+      cell = '';
+      continue;
+    }
+    cell += char;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function isDelimiterCell(cell: string): boolean {
+  return /^:?-{3,}:?$/.test(cell);
+}
+
+function columnAlign(cell: string): ColumnAlign {
+  const left = cell.startsWith(':');
+  const right = cell.endsWith(':');
+  if (left && right) return 'center';
+  return right ? 'right' : 'left';
+}
+
+function tableRowCells(raw: string): string[] | null {
+  if (!raw.includes('|')) return null;
+  const cells = splitTableRow(raw);
+  return cells.length >= 2 ? cells : null;
+}
+
+/**
+ * Renders a GitHub-style table inside `width`. Cells wrap inside their column;
+ * if the columns cannot be made readable, the caller falls back to plain text.
+ */
+function tableLines(
+  header: string[],
+  delimiter: string[],
+  body: string[][],
+  width: number,
+): MarkdownLine[] | null {
+  const columns = header.length;
+  const aligns = delimiter.map(columnAlign);
+  const headerCells = header.map((cell) => inlineSegments(cell, { bold: true }));
+  const bodyCells: MarkdownSegment[][][] = body.map((row) =>
+    Array.from({ length: columns }, (_, column) => inlineSegments(row[column] ?? '')),
+  );
+
+  const natural = headerCells.map((segments, column) => {
+    let widest = segmentWidth(segments);
+    for (const row of bodyCells) {
+      widest = Math.max(widest, segmentWidth(row[column]!));
+    }
+    return Math.max(MIN_TABLE_COLUMN, widest);
+  });
+  const overhead = columns * 3 + 1;
+  const available = width - overhead;
+  if (available < columns * MIN_TABLE_COLUMN) return null;
+
+  const widths = [...natural];
+  let total = widths.reduce((sum, value) => sum + value, 0);
+  while (total > available) {
+    let widest = 0;
+    for (let column = 1; column < widths.length; column++) {
+      if (widths[column]! > widths[widest]!) widest = column;
+    }
+    if (widths[widest]! <= MIN_TABLE_COLUMN) return null;
+    widths[widest] = widths[widest]! - 1;
+    total--;
+  }
+
+  const border = (left: string, middle: string, right: string): MarkdownLine => ({
+    segments: [
+      {
+        text: `${left}${widths.map((cellWidth) => '─'.repeat(cellWidth + 2)).join(middle)}${right}`,
+        dim: true,
+      },
+    ],
+  });
+
+  const renderRow = (cells: MarkdownSegment[][]): MarkdownLine[] => {
+    const wrapped = cells.map((segments, column) => wrapSegments(segments, widths[column]!));
+    const height = Math.max(...wrapped.map((lines) => lines.length));
+    const rendered: MarkdownLine[] = [];
+    for (let lineIndex = 0; lineIndex < height; lineIndex++) {
+      const segments: MarkdownSegment[] = [{ text: '│', dim: true }];
+      for (let column = 0; column < columns; column++) {
+        const cellLine = wrapped[column]![lineIndex] ?? [{ text: '' }];
+        const padding = Math.max(0, widths[column]! - segmentWidth(cellLine));
+        const align = aligns[column]!;
+        const leftPad = align === 'right' ? padding : align === 'center' ? Math.floor(padding / 2) : 0;
+        const rightPad = padding - leftPad;
+        segments.push({ text: ' ' });
+        if (leftPad > 0) segments.push({ text: ' '.repeat(leftPad) });
+        segments.push(...cellLine);
+        if (rightPad > 0) segments.push({ text: ' '.repeat(rightPad) });
+        segments.push({ text: ' ' }, { text: '│', dim: true });
+      }
+      rendered.push({ segments });
+    }
+    return rendered;
+  };
+
+  const lines: MarkdownLine[] = [border('┌', '┬', '┐')];
+  lines.push(...renderRow(headerCells));
+  lines.push(border('├', '┼', '┤'));
+  for (const row of bodyCells) lines.push(...renderRow(row));
+  lines.push(border('└', '┴', '┘'));
+  return lines;
+}
+
 function renderLine(raw: string, width: number): MarkdownLine[] {
   if (!raw.trim()) return [EMPTY_LINE];
 
@@ -311,8 +447,10 @@ export function renderMarkdown(text: string, width: number): MarkdownLine[] {
   if (!source) return [EMPTY_LINE];
 
   const lines: MarkdownLine[] = [];
+  const sourceLines = source.split('\n');
   let fence: string | null = null;
-  for (const raw of source.split('\n')) {
+  for (let index = 0; index < sourceLines.length; index++) {
+    const raw = sourceLines[index]!;
     const match = /^\s*(`{3,}|~{3,})/.exec(raw);
     if (fence) {
       if (match && raw.trim().replace(/[`~]/g, '') === '') {
@@ -326,6 +464,33 @@ export function renderMarkdown(text: string, width: number): MarkdownLine[] {
       fence = match[1]!;
       continue;
     }
+
+    const next = sourceLines[index + 1];
+    if (next !== undefined) {
+      const header = splitTableRow(raw);
+      const delimiter = splitTableRow(next);
+      if (
+        header.length >= 2 &&
+        delimiter.length === header.length &&
+        delimiter.every(isDelimiterCell)
+      ) {
+        const rows: string[][] = [];
+        let end = index + 2;
+        while (end < sourceLines.length) {
+          const cells = tableRowCells(sourceLines[end]!);
+          if (!cells) break;
+          rows.push(cells);
+          end++;
+        }
+        const rendered = tableLines(header, delimiter, rows, safeWidth);
+        if (rendered) {
+          lines.push(...rendered);
+          index = end - 1;
+          continue;
+        }
+      }
+    }
+
     lines.push(...renderLine(raw, safeWidth));
   }
   return lines;

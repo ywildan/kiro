@@ -110,6 +110,12 @@ import {
 import { renderMarkdown } from '../src/ui/markdown.js';
 import { MOUSE_SCROLL_LINES, isMouseSequence, parseMouseWheel } from '../src/ui/mouse.js';
 import { StatusBar } from '../src/ui/StatusBar.js';
+import {
+  UsageCard,
+  USAGE_CARD_WIDTH,
+  shouldShowUsageCard,
+} from '../src/ui/UsageCard.js';
+import { addUsage, EMPTY_USAGE, normalizeUsage } from '../src/usage.js';
 import { buildResumedView } from '../src/ui/history.js';
 import { loadPromptHistory, recordPrompt, rememberPrompt } from '../src/ui/prompt-history.js';
 import { snapshotBeforeMutation, undoLastCheckpoint } from '../src/tools/checkpoint.js';
@@ -1533,15 +1539,18 @@ async function main(): Promise<void> {
         { role: 'tool', tool_call_id: 'call_1', name: 'write_file', content: 'Created hello.txt.' },
         { role: 'assistant', content: 'Done.' },
       ];
+      const firstUsage = { promptTokens: 1_200, completionTokens: 340, requests: 3 };
       const first = await saveSession({
         cwd: workspace,
         profile: 'default',
         model: 'mock-model',
         messages: firstMessages,
+        usage: firstUsage,
       });
       assert.ok(isSessionId(first.id));
       assert.equal(first.title, 'Create hello.txt');
       assert.equal(first.messages.length, 4);
+      assert.deepEqual(first.usage, firstUsage);
       assert.ok(first.messages.every((message) => message.role !== 'system'));
 
       const dir = projectSessionsDir(workspace);
@@ -1553,6 +1562,7 @@ async function main(): Promise<void> {
       assert.equal(loaded.cwd, path.resolve(workspace));
       assert.equal(loaded.profile, 'default');
       assert.equal(loaded.model, 'mock-model');
+      assert.deepEqual(loaded.usage, firstUsage);
 
       await sleep(20);
       const second = await saveSession({
@@ -1824,6 +1834,89 @@ async function main(): Promise<void> {
     assert.match(flat, /• Satu/);
   });
 
+  await test('Markdown tables align columns and wrap inside the available width', async () => {
+    const plain = (source: string, width: number): string =>
+      renderMarkdown(source, width)
+        .map((line) => line.segments.map((segment) => segment.text).join(''))
+        .join('\n');
+
+    const source = [
+      '| Kategori | Kemampuan |',
+      '| :--- | ---: |',
+      '| Cari & Baca | glob, grep, `read_file` |',
+      '| Edit | edit_file, multi_edit |',
+    ].join('\n');
+    const rendered = renderMarkdown(source, 60);
+    const text = rendered
+      .map((line) => line.segments.map((segment) => segment.text).join(''))
+      .join('\n');
+    assert.match(text, /┌─+┬─+┐/);
+    assert.match(text, /├─+┼─+┤/);
+    assert.match(text, /└─+┴─+┘/);
+    assert.match(text, /Kategori/);
+    assert.match(text, /Cari & Baca/);
+    assert.match(text, /read_file/);
+    assert.equal(
+      rendered
+        .flatMap((line) => line.segments)
+        .find((segment) => segment.text.includes('Kategori'))?.bold,
+      true,
+      'header cells stay bold',
+    );
+    for (const line of rendered) {
+      assert.ok(displayWidth(line.segments.map((segment) => segment.text).join('')) <= 60);
+    }
+
+    const aligned = plain(
+      ['| Name | Count |', '| --- | ---: |', '| a | 42 |'].join('\n'),
+      40,
+    );
+    assert.match(aligned, /│ a +│ +42 │/);
+
+    const wideCell = 'word '.repeat(12).trim();
+    const narrow = plain(
+      ['| A | B |', '| --- | --- |', `| ${wideCell} | x |`].join('\n'),
+      34,
+    );
+    assert.match(narrow, /┌/);
+    for (const line of renderMarkdown(
+      ['| A | B |', '| --- | --- |', `| ${wideCell} | x |`].join('\n'),
+      34,
+    )) {
+      assert.ok(displayWidth(line.segments.map((segment) => segment.text).join('')) <= 34);
+    }
+
+    const escaped = plain(
+      ['| A | B |', '| --- | --- |', '| a \\| b | `x|y` |'].join('\n'),
+      50,
+    );
+    assert.match(escaped, /a \| b/);
+    assert.match(escaped, /x\|y/);
+
+    const fenced = plain(['```', '| A | B |', '| --- | --- |', '```'].join('\n'), 50);
+    assert.doesNotMatch(fenced, /┌/);
+    assert.match(fenced, /\| A \| B \|/);
+
+    const tiny = plain(['| A | B |', '| --- | --- |', '| one | two |'].join('\n'), 10);
+    assert.doesNotMatch(tiny, /┌/);
+    assert.match(tiny, /\| A \| B \|/);
+
+    const built = buildLines([{ kind: 'assistant', id: 1, text: source }], 60);
+    const flat = built
+      .map((line) =>
+        line.segments ? line.segments.map((segment) => segment.text).join('') : line.text,
+      )
+      .join('\n');
+    assert.match(flat, /┌/);
+    for (const line of built) {
+      const content = line.segments
+        ? line.segments.map((segment) => segment.text).join('')
+        : line.text;
+      const suffix = line.suffix?.text ?? '';
+      assert.ok(displayWidth(`${line.prefix}${content}${suffix}`) <= 60);
+    }
+  });
+
   await test('slash command filtering and help share one list', async () => {
     assert.deepEqual(
       filterSlashCommands('/').map((command) => command.name),
@@ -1841,6 +1934,7 @@ async function main(): Promise<void> {
       '/context',
       '/compact',
     ]);
+    assert.deepEqual(filterSlashCommands('/us').map((command) => command.name), ['/usage']);
     assert.deepEqual(filterSlashCommands('/HE').map((command) => command.name), ['/help']);
     assert.deepEqual(filterSlashCommands('/model add'), []);
     assert.deepEqual(filterSlashCommands('/nope'), []);
@@ -1852,6 +1946,7 @@ async function main(): Promise<void> {
     const help = slashHelpLines().join('\n');
     assert.match(help, /\/exit\s+quit Kiro/);
     assert.match(help, /\/context\s+show approximate context usage/);
+    assert.match(help, /\/usage\s+show or hide the usage card/);
   });
 
   await test('mouse wheel parsing scrolls and ignores clicks', async () => {
@@ -1916,6 +2011,87 @@ async function main(): Promise<void> {
     const narrow = line({ width: 44, yolo: true });
     assert.match(narrow, /YOLO/);
     assert.ok(displayWidth(narrow) <= 44);
+  });
+
+  await test('the usage card shows session totals, context, and reply speed', async () => {
+    const render = (props: Record<string, unknown>): string =>
+      renderToString(
+        React.createElement(UsageCard, {
+          width: USAGE_CARD_WIDTH,
+          usage: EMPTY_USAGE,
+          contextTokens: 0,
+          contextWindow: 64_000,
+          contextEstimated: true,
+          lastReply: null,
+          busy: false,
+          ...props,
+        }),
+      ).trimEnd();
+
+    const card = render({
+      usage: { promptTokens: 9_400, completionTokens: 3_100, requests: 8 },
+      contextTokens: 40_000,
+      contextEstimated: false,
+      lastReply: { durationMs: 4_400, tokensPerSecond: 12 },
+    });
+    assert.match(card, /Usage · 8 req/);
+    assert.match(card, /↑ 9\.4k/);
+    assert.match(card, /↓ 3\.1k/);
+    assert.match(card, /63%/);
+    assert.match(card, /40k \/ 64k window/);
+    assert.match(card, /last 4\.4s · 12 tok\/s/);
+    assert.match(card, /[█]+[░]+/, 'the context gauge shows filled and empty cells');
+    for (const line of card.split('\n')) {
+      assert.ok(displayWidth(line) <= USAGE_CARD_WIDTH, `card line fits: ${line}`);
+    }
+
+    const empty = render({});
+    assert.match(empty, /↑ —/);
+    assert.match(empty, /↓ —/);
+    assert.match(empty, /no timed reply yet/);
+    assert.match(empty, /~0 \/ 64k window/);
+    assert.match(empty, /0%/);
+
+    const estimated = render({ contextTokens: 40_000 });
+    assert.match(estimated, /~40k \/ 64k window/);
+
+    const fast = render({
+      usage: { promptTokens: 9_000, completionTokens: 3_100, requests: 1 },
+      lastReply: { durationMs: 134, tokensPerSecond: 23_134 },
+    });
+    assert.match(fast, /last 134ms · 23k tok\/s/);
+    assert.doesNotMatch(fast, /23134/);
+
+    assert.equal(shouldShowUsageCard(109, 24), false);
+    assert.equal(shouldShowUsageCard(110, 24), true);
+    assert.equal(shouldShowUsageCard(140, 8), false);
+    assert.equal(shouldShowUsageCard(140, 9), true);
+
+    const accumulated = addUsage(EMPTY_USAGE, {
+      promptTokens: 11,
+      completionTokens: 3,
+      totalTokens: 14,
+    });
+    assert.deepEqual(accumulated, { promptTokens: 11, completionTokens: 3, requests: 1 });
+    assert.deepEqual(
+      addUsage(accumulated, { promptTokens: 5, completionTokens: 7, totalTokens: 12 }),
+      { promptTokens: 16, completionTokens: 10, requests: 2 },
+    );
+    assert.deepEqual(normalizeUsage(undefined), {
+      promptTokens: 0,
+      completionTokens: 0,
+      requests: 0,
+    });
+    assert.deepEqual(normalizeUsage({ promptTokens: 5.4, completionTokens: -2, requests: 'many' }), {
+      promptTokens: 5,
+      completionTokens: 0,
+      requests: 0,
+    });
+    assert.deepEqual(normalizeUsage([1, 2]), {
+      promptTokens: 0,
+      completionTokens: 0,
+      requests: 0,
+    });
   });
 
   await test('middle truncation fits the budget and keeps both ends', async () => {
@@ -3059,8 +3235,13 @@ async function main(): Promise<void> {
               arguments: { path: 'headless.txt', content: 'from headless\n' },
             },
           ],
+          usage: { prompt_tokens: 50, completion_tokens: 5 },
         },
-        { type: 'text', text: 'All done.' },
+        {
+          type: 'text',
+          text: 'All done.',
+          usage: { prompt_tokens: 60, completion_tokens: 7 },
+        },
       ],
     });
     const dir = await tempDir('kiro-headless-');
@@ -3128,10 +3309,17 @@ async function main(): Promise<void> {
       assert.match(first.stderr, /write_file/);
       assert.equal(await readFile(path.join(project, 'headless.txt'), 'utf8'), 'from headless\n');
       const saved = await readdir(env.KIRO_SESSIONS_DIR, { recursive: true });
-      assert.ok(
-        saved.some((entry) => entry.endsWith('.json')),
-        'headless runs persist a session like the TUI',
+      const sessionFile = saved.find((entry) => entry.endsWith('.json'));
+      assert.ok(sessionFile, 'headless runs persist a session like the TUI');
+      const savedRecord = JSON.parse(
+        await readFile(path.join(env.KIRO_SESSIONS_DIR, sessionFile), 'utf8'),
       );
+      assert.equal(savedRecord.title, 'Create the file.');
+      assert.deepEqual(savedRecord.usage, {
+        promptTokens: 110,
+        completionTokens: 12,
+        requests: 2,
+      });
 
       const piped = await runCli(['-p', '-', '--yolo'], 'Say hello.');
       assert.equal(piped.status, 0, piped.stderr);

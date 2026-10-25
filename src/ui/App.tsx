@@ -59,6 +59,14 @@ import { formatProfileList } from './profile-list.js';
 import { loadPromptHistory, recordPrompt } from './prompt-history.js';
 import { StatusBar, type Activity } from './StatusBar.js';
 import { summarizeToolArgs } from './text.js';
+import {
+  UsageCard,
+  USAGE_CARD_GAP,
+  USAGE_CARD_WIDTH,
+  shouldShowUsageCard,
+  type LastReplyStats,
+} from './UsageCard.js';
+import { addUsage, EMPTY_USAGE, type UsageTotals } from '../usage.js';
 import { undoLastCheckpoint } from '../tools/checkpoint.js';
 import {
   MAX_EXPANDED_TOOL_CHARS,
@@ -168,6 +176,7 @@ export function App({
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [palette, setPalette] = useState<PaletteState | null>(null);
+  const [usageCardEnabled, setUsageCardEnabled] = useState(true);
   const [mouseOn, setMouseOn] = useState(mouseEnabled);
   const [expandedToolId, setExpandedToolId] = useState<number | null>(null);
 
@@ -177,6 +186,11 @@ export function App({
   const usageRef = useRef<{ tokens: number; messageCount: number } | null>(null);
   const roundStartedAtRef = useRef(0);
   const roundCompletionTokensRef = useRef<number | null>(null);
+  const [sessionUsage, setSessionUsage] = useState<UsageTotals>(
+    () => initialSession?.usage ?? EMPTY_USAGE,
+  );
+  const sessionUsageRef = useRef(sessionUsage);
+  const [lastReply, setLastReply] = useState<LastReplyStats | null>(null);
   const [contextTokens, setContextTokens] = useState(() => estimateMessagesTokens(messagesRef.current));
   const contextTokensRef = useRef(contextTokens);
   const sessionRef = useRef<SessionState | null>(
@@ -450,6 +464,7 @@ export function App({
     }
     const session = sessionRef.current;
     const snapshot = structuredClone(messages);
+    const usage = { ...sessionUsageRef.current };
     const write = saveChainRef.current
       .then(() =>
         saveSession({
@@ -460,6 +475,7 @@ export function App({
           title: session.title,
           createdAt: session.createdAt,
           messages: snapshot,
+          usage,
         }),
       )
       .then(() => undefined)
@@ -668,6 +684,7 @@ export function App({
                   ? Math.round(completionTokens / (durationMs / 1_000))
                   : undefined;
               finalizeAssistant(event.content, durationMs, tokensPerSecond);
+              setLastReply({ durationMs, tokensPerSecond });
               roundCompletionTokensRef.current = null;
               setReplying(false);
               recomputeContext();
@@ -717,16 +734,20 @@ export function App({
               roundStartedAtRef.current = Date.now();
               roundCompletionTokensRef.current = null;
               break;
-            case 'usage':
+            case 'usage': {
               usageRef.current = {
                 tokens: event.usage.totalTokens,
                 // The assistant message from this response is appended after the
                 // stream ends and is already counted in totalTokens.
                 messageCount: messagesRef.current.length + 1,
               };
+              const totals = addUsage(sessionUsageRef.current, event.usage);
+              sessionUsageRef.current = totals;
+              setSessionUsage(totals);
               roundCompletionTokensRef.current = event.usage.completionTokens;
               recomputeContext();
               break;
+            }
             case 'notice':
               flushText();
               addNotice(event.level, event.message);
@@ -977,6 +998,7 @@ export function App({
           const count = (role: ChatMessage['role']): number =>
             estimateMessagesTokens(messagesRef.current.filter((message) => message.role === role));
           const usage = usageRef.current;
+          const totals = sessionUsageRef.current;
           addNotice(
             'info',
             [
@@ -989,8 +1011,27 @@ export function App({
               usage
                 ? `Last API usage: ${usage.tokens.toLocaleString()} tokens for the last request and response.`
                 : 'The endpoint has not reported usage; counts are estimated at roughly 4 characters per token.',
+              totals.requests > 0
+                ? `Session usage: ↑ ${formatTokens(totals.promptTokens)} sent, ↓ ${formatTokens(totals.completionTokens)} received ` +
+                  `across ${totals.requests} API request${totals.requests === 1 ? '' : 's'} (saved with this session).`
+                : 'Session usage: the endpoint has not reported token counts for this session yet.',
               `Auto-compaction runs at ${Math.round(COMPACT_THRESHOLD * 100)}% and keeps the last ${COMPACT_KEEP_USER_TURNS} user turns verbatim. /compact runs it now.`,
             ].join('\n'),
+          );
+          return;
+        }
+        case '/usage': {
+          if (argument) {
+            addNotice('error', 'Usage: /usage (toggles the usage card)');
+            return;
+          }
+          const next = !usageCardEnabled;
+          setUsageCardEnabled(next);
+          addNotice(
+            'info',
+            next
+              ? 'Usage card on; it appears when the terminal is at least 110 columns wide.'
+              : 'Usage card hidden; the transcript gets the full width. Use /usage to show it again.',
           );
           return;
         }
@@ -1120,6 +1161,10 @@ export function App({
             const record = await loadSession(cwd, targetId);
             messagesRef.current = record.messages.filter((message) => message.role !== 'system');
             usageRef.current = null;
+            const restoredUsage = record.usage ?? EMPTY_USAGE;
+            sessionUsageRef.current = restoredUsage;
+            setSessionUsage(restoredUsage);
+            setLastReply(null);
             recomputeContext();
             sessionRef.current = {
               id: record.id,
@@ -1156,6 +1201,9 @@ export function App({
             await saveChainRef.current;
             messagesRef.current = [];
             usageRef.current = null;
+            sessionUsageRef.current = EMPTY_USAGE;
+            setSessionUsage(EMPTY_USAGE);
+            setLastReply(null);
             updateContextTokens(0);
             sessionRef.current = null;
             listedSessionsRef.current = null;
@@ -1299,6 +1347,7 @@ export function App({
       runModelFlow,
       runProfileTest,
       updateContextTokens,
+      usageCardEnabled,
       version,
       yolo,
     ],
@@ -1454,18 +1503,34 @@ export function App({
     3,
     rows - 5 - (pendingApproval ? 12 : 0) - (pickerOpen ? 13 : 0),
   );
+  const showUsageCard = usageCardEnabled && shouldShowUsageCard(columns, viewportHeight);
+  const chatWidth = showUsageCard ? Math.max(40, width - USAGE_CARD_WIDTH - USAGE_CARD_GAP) : width;
 
   return (
     <Box flexDirection="column" width={columns} paddingX={1}>
-      <MessageList
-        items={items}
-        width={width}
-        height={viewportHeight}
-        resetSignal={resetSignal}
-        expandedToolId={expandedToolId}
-        palette={palette}
-        interactive={!pendingApproval && !pickerOpen && !wizardActive && wizardPrompt === null}
-      />
+      <Box flexDirection="row" alignItems="flex-start" width={width}>
+        <MessageList
+          items={items}
+          width={chatWidth}
+          height={viewportHeight}
+          resetSignal={resetSignal}
+          expandedToolId={expandedToolId}
+          palette={palette}
+          interactive={!pendingApproval && !pickerOpen && !wizardActive && wizardPrompt === null}
+        />
+        {showUsageCard ? (
+          <Box marginLeft={USAGE_CARD_GAP} flexShrink={0}>
+            <UsageCard
+              usage={sessionUsage}
+              contextTokens={contextTokens}
+              contextWindow={contextWindow}
+              contextEstimated={usageRef.current === null}
+              lastReply={lastReply}
+              busy={busy}
+            />
+          </Box>
+        ) : null}
+      </Box>
       {pendingApproval ? (
         <ApprovalPrompt
           request={pendingApproval}
@@ -1517,8 +1582,8 @@ export function App({
         queued={queuedCount > 0 ? queuedCount : undefined}
         yolo={yolo}
         autoAllowed={autoAllowed}
-        contextTokens={contextTokens}
-        contextWindow={contextWindow}
+        contextTokens={showUsageCard ? undefined : contextTokens}
+        contextWindow={showUsageCard ? undefined : contextWindow}
       />
     </Box>
   );

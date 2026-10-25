@@ -8,6 +8,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', description: 'show this help' },
   { name: '/model', usage: '[name | add | edit | remove | test | list]', description: 'list or switch models' },
   { name: '/context', description: 'show approximate context usage' },
+  { name: '/usage', description: 'show or hide the usage card' },
   { name: '/compact', description: 'summarize older turns to free context' },
   { name: '/sessions', description: 'list saved sessions for this directory' },
   { name: '/resume', usage: '<n | id>', description: 'resume a saved session' },

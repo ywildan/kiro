@@ -22,6 +22,7 @@ import {
   type SessionRecord,
 } from './sessions.js';
 import { redactSecrets } from './secrets.js';
+import { addUsage, normalizeUsage } from './usage.js';
 
 export interface HeadlessOptions {
   config: { activeProfile: string; profiles: Record<string, ProfileConfig> };
@@ -133,6 +134,7 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
           updatedAt: new Date().toISOString(),
           messages: [],
         };
+    let usage = normalizeUsage(record.usage);
 
     const window = contextWindowFor(profile);
     const compactContext = async (
@@ -192,6 +194,8 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
       } else if (event.type === 'tool-start') {
         flushReasoning();
         stderr.write(`# ${toolCallLine(event.toolCall)}\n`);
+      } else if (event.type === 'usage') {
+        usage = addUsage(usage, event.usage);
       } else if (event.type === 'notice') {
         flushReasoning();
         notice(event.message);
@@ -222,6 +226,7 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
         title: record.title || titleFromMessages(cleaned),
         createdAt: record.createdAt,
         messages: cleaned,
+        usage,
       });
     }
     return exitCode;
