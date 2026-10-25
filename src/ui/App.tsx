@@ -1508,7 +1508,7 @@ export function App({
 
   return (
     <Box flexDirection="column" width={columns} paddingX={1}>
-      <Box flexDirection="row" alignItems="flex-start" width={width}>
+      <Box flexDirection="row" alignItems="flex-end" width={width}>
         <MessageList
           items={items}
           width={chatWidth}
