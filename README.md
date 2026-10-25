@@ -232,6 +232,9 @@ kiro [options]
   --model <name>     Override the active profile's model
   -c, --continue     Resume the most recent session for this directory
   --resume <id>      Resume a specific saved session
+  -p, --prompt <text>
+                     Run one turn without a TUI ("-" or no text reads the
+                     prompt from stdin); replies stream to stdout
   --yolo             Skip all approval prompts (use with care)
   --mouse            Mouse reporting (on by default): wheel scrolls the transcript
   --no-mouse         Disable mouse reporting so plain click-drag selection works
@@ -242,6 +245,24 @@ kiro [options]
 
 `--flag=value` works as well. CLI overrides last for the current process only.
 
+## Headless mode
+
+`kiro -p "…"` runs a single turn without Ink, for scripts, cron jobs, and CI:
+
+```bash
+kiro -p "explain what this repo does"                  # read-only answers work immediately
+kiro -p "add the missing tests" --yolo                 # let it write and run commands
+git diff | kiro -p "review this patch"                 # pipe the prompt
+kiro -p "continue" --continue                          # continue this directory's session
+echo "summarize README.md" | kiro -p - > summary.md    # "-" reads stdin
+```
+
+Assistant text goes to **stdout**; tool calls, reasoning, compaction notices, and errors go to **stderr**, so `kiro -p … > out.md` stays clean. The turn uses the same provider, tools, system prompt, compaction, and session store as the TUI, and the session is saved when it finishes.
+
+Approvals are denied in headless mode unless you pass `--yolo`: a piped run never performs an unsupervised write or command. When a read-only tool is enough, leave `--yolo` off.
+
+Exit codes: `0` success, `1` model/tool/session error, `2` usage error (including a missing prompt), `130` cancelled with Ctrl+C. Prompt history is not recorded for headless runs. Set `KIRO_STREAM_IDLE_MS` to change the stall timeout (default 120000 ms; `0` disables it).
+
 ## Using the TUI
 
 | Key | Action |
@@ -250,7 +271,7 @@ kiro [options]
 | `Ctrl+C` | Cancel the running turn; press again to exit |
 | `PgUp` / `PgDn` | Scroll the history (the wheel works too, unless you pass `--no-mouse`) |
 | `Ctrl+O` | Expand or collapse the full output of the most recent tool call |
-| `↑` / `↓` | Move through the `/` command menu |
+| `↑` / `↓` | Move through the `/` command menu; with an empty input, recall prompt history |
 | `Tab` | Complete the highlighted `/` command |
 | `Esc` | Clear the input, close the command menu, cancel a model wizard step, or deny a pending approval |
 | `Ctrl+A` / `Ctrl+E` | Move to start / end of input |
@@ -259,7 +280,13 @@ kiro [options]
 | `Ctrl+W` | Delete the previous word |
 | Left / Right / Home / End | Move the cursor |
 
-The status bar shows the active profile and model, the working directory, the context meter (`ctx 42k/128k`), and the current state (`ready`, `thinking…`, `retrying (n/3)…`, `running <tool>…`, `approval needed`, `cancelling…`). A long profile name is shortened in the middle, so the model and directory stay readable.
+The status bar shows the active profile and model, the working directory, the context meter (`ctx 42k/128k`), the number of queued messages, and the current state (`ready`, `thinking…`, `retrying (n/3)…`, `running <tool>…`, `approval needed`, `cancelling…`). A long profile name is shortened in the middle, so the model and directory stay readable.
+
+The input stays enabled while the agent works: type the next prompt and press Enter to queue it, and it runs as soon as the current turn ends. Queued prompts appear in the transcript right away, the status bar shows `N queued`, and Ctrl+C clears the queue together with the running turn. Slash commands typed while busy are queued the same way.
+
+Prompt history is stored per working directory in `~/.kiro/history/` (mode `0600`, up to 200 entries). With an empty input, `↑` recalls the most recent prompt, `↓` walks forward again, and editing the recalled text leaves history mode. Registered API-key values are redacted before a prompt is written. Set `KIRO_HISTORY_DIR` to store the files elsewhere.
+
+Reasoning models stream their thinking traces live as a dim `thinking…` block. Once the visible answer starts, the trace collapses to a single `reasoning (done, not saved)` line: traces are display-only and are never written to sessions or `/export`.
 
 Assistant replies are rendered as Markdown: headings, bold/italic, inline code, bullet and numbered lists, task checkboxes, blockquotes, links, and fenced code blocks. Unknown or incomplete markers fall back to their literal text, so streaming never breaks the layout.
 
@@ -287,6 +314,7 @@ Slash commands:
 | `/compact` | Summarize older turns now, keeping the last four user turns verbatim |
 | `/sessions` | List saved sessions for this working directory |
 | `/resume <n\|id>` | Resume a session by list number or id (prefixes work) |
+| `/undo` | Revert the most recent write, edit, or patch (repeat to step further back) |
 | `/clear` | Start a new session, keeping the old one on disk |
 | `/export [file]` | Write the transcript (with full tool output) to a Markdown file |
 | `/mouse` | Toggle mouse reporting: wheel scroll vs normal text selection |
@@ -361,6 +389,12 @@ Read-only tools (`read_file`, `list_dir`, `glob`, `grep`) that the model request
 
 `--yolo` skips all approvals: the status bar shows a red `YOLO` badge, the first line of the transcript warns about it, and `/help` reminds you. It cannot be turned off from inside the session — restart without the flag. Use it only in a directory you trust.
 
+### Undo and checkpoints
+
+Before every `write_file`, `edit_file`, `multi_edit`, or `apply_patch`, Kiro copies the affected files into `~/.kiro/checkpoints/<cwd-hash>/` (mode `0700`, backups `0600`). `/undo` restores the most recent call: edited files get their previous bytes back, and files the call created are deleted. Running `/undo` again steps further back through the 30 most recent calls.
+
+Checkpoints are best effort: if a snapshot cannot be taken, the tool still runs. `run_command` is **not** checkpointed, because a shell command can touch anything; commit before letting Kiro run destructive commands. Set `KIRO_CHECKPOINTS_DIR` to store snapshots elsewhere. The manifest records backup paths, not file contents, so it stays small even in large repositories.
+
 ## AGENTS.md
 
 If an `AGENTS.md` file exists in the working directory, its contents are appended to the system prompt for every turn, so project-specific instructions apply immediately, including after edits.
@@ -368,6 +402,8 @@ If an `AGENTS.md` file exists in the working directory, its contents are appende
 ## How it works
 
 - The OpenAI provider posts to `{baseUrl}/chat/completions` with `stream: true`, parses SSE incrementally, and assembles tool-call deltas by index. It also accepts a plain JSON response from servers that ignore streaming, and reads `usage` when the endpoint sends it.
+- OpenAI reasoning models (`o1`/`o3`/`o4`, `gpt-5`) automatically switch from `max_tokens` to `max_completion_tokens` and omit a custom temperature. If any other endpoint rejects `max_tokens` with a 400/422 that names `max_completion_tokens`, Kiro retries once with the new parameter without consuming a retry slot. Thinking deltas from `reasoning_content`, `reasoning`, and OpenRouter's `reasoning_details` are streamed to the TUI and never persisted.
+- A stream with no bytes for `KIRO_STREAM_IDLE_MS` (default 120 seconds, `0` disables) is cancelled and retried like a dropped connection, instead of hanging the TUI forever.
 - Before each model round, Kiro checks the context estimate (corrected by the last reported usage) against the profile's `contextWindow`. At ~80% it replaces older turns with a model-written summary, keeps the last four user turns, and then sends the request.
 - When a profile has no explicit `contextWindow`, Kiro infers one from the model id (a size suffix such as `-32k`, else a family table: `gpt-4o` 128k, `gpt-4` 8k, `o1`/`o3` 200k, `claude-3/4` 200k, `gemini` 1M, `llama-3.1` 128k, …) and falls back to 128k for unknown ids. `/context` says whether the number is inferred; set `contextWindow` in the profile to pin it.
 - If the endpoint still rejects a request as too long (HTTP 400/413 with a context-length message), Kiro forces a compaction and retries that round once instead of ending the turn with a bare error.
@@ -377,6 +413,7 @@ If an `AGENTS.md` file exists in the working directory, its contents are appende
 - Transient failures are retried up to three times with exponential backoff and jitter: network errors, connection drops before any output, HTTP 429, and 5xx. `Retry-After` is honoured (capped at 60 seconds), and the TUI shows `retrying (n/3)…`. A 400/401/403/404, a malformed stream, a cancel, or a failure after partial text is never retried. Set `KIRO_RETRY_BASE_MS` to change the base backoff (default 500ms).
 - Malformed tool-call JSON, unknown tool names, non-zero exits, and timeouts are returned to the model as tool errors rather than crashing the session.
 - Ctrl+C aborts the HTTP stream and any running command; partial assistant text is preserved.
+- `kiro -p` runs the same agent loop without Ink, streams assistant text to stdout and diagnostics to stderr, denies tool calls unless `--yolo` is given, and saves the session like the TUI.
 - Sessions are saved atomically after each user message and completed turn, and are restored by rebuilding the visible transcript from the stored messages.
 - Model discovery calls `GET {baseUrl}/models` with a 10-second timeout; the connection test sends one tiny non-tool chat completion with the same timeout. Both can be cancelled.
 - Config saves are atomic and merge into the file on disk, so fields Kiro does not know about are preserved. Invalid JSON can be backed up and replaced with a fresh template.
@@ -395,11 +432,14 @@ The suite covers streaming, multiple tool calls per response, approvals and deni
 
 Model workflow tests use a temp `$HOME` so the real `~/.kiro` is never touched. They cover atomic config saves that preserve unknown fields, profile-name and URL validation, corrupt-config backup/recovery, `.env` parsing and real-environment precedence, `0600` writes, masking, the exact preset list, discovery success/401/missing-`/models`/timeout, the connection test, and wizard add/edit/select/remove/last-profile refusal/cancel/manual-model fallback. Scripted `kiro model add`, `list`, `use`, `test`, and `remove` run through the real CLI against the in-process mock; a failed test saves nothing, keys never appear in `config.json`, and generated keys land in `.env`. The wizard screen renderer is unit-tested against a fake stream: alternate-screen enter/leave, a new menu replacing the previous one, the breadcrumb of answered prompts (menu title instead of `Choose`, the value kept by pressing Enter, confirmation of a `Y/n` default, and the reset on Escape or a return to the root menu), stale errors dropped at a step change, log trimming to the terminal height with the prompt always visible, keyboard scrolling of an over-long list (page, top, bottom, clamping, reset on new output), and replaying results after the screen is restored. `/model` groups profiles by endpoint so several models behind one base URL are listed as siblings.
 
+The newer paths have their own coverage: `max_completion_tokens` selection for reasoning models and recovery from a `max_tokens` rejection, `reasoning_content` deltas reaching the agent and collapsing in the renderer, the stream idle timeout, checkpoint edit/create undo with backup files outside the manifest, and prompt-history dedupe/capping/redaction. A spawned `kiro -p` test runs a tool with `--yolo`, checks the reply and saved session, feeds a piped prompt through `-p -`, and verifies the non-TTY hint without `-p`.
+
 ## Project layout
 
 ```
 src/
   index.tsx          CLI entry point
+  headless.ts        one-shot -p runner (stdout text, stderr diagnostics)
   config.ts          config load/validation/overrides, atomic save, recovery
   env.ts             ~/.kiro/.env parser/writer, masking, key status
   secrets.ts         credential registry: redaction and child-process env filtering
@@ -407,8 +447,8 @@ src/
   model/             presets, discovery/test, context-window inference, shared wizard, CLI + screen renderer
   providers/         Provider interface, OpenAI-compatible implementation
   agent/             system prompt, agent loop, token estimates, compaction
-  tools/             tool registry, fs/search/patch/shell tools, glob/gitignore matching
-  ui/                Ink app, markdown, command palette, scrolling, approvals, status bar, export
+  tools/             tool registry, fs/search/patch/shell tools, checkpoints, glob/gitignore matching
+  ui/                Ink app, markdown, command palette, prompt history, scrolling, approvals, status bar, export
 test/
   mock-server.ts     scripted OpenAI-compatible SSE server + /models variants
   e2e.ts             backend test suite
@@ -421,6 +461,8 @@ test/
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
 - No sub-agents, MCP, plugins, web search, image input, themes, or git integration.
 - Sessions are single-process and stored as plaintext JSON. There is no delete or rename command and no cross-directory session browser; `/export` writes a Markdown transcript you can keep or copy from.
+- `/undo` covers `write_file`, `edit_file`, `multi_edit`, and `apply_patch` only. It keeps the last 30 calls, and `run_command` changes are outside its reach; use Git for a complete safety net.
+- Prompt history is plaintext, capped at 200 entries per directory, and only recalled in the TUI (not in `-p` mode).
 - Only contiguous read-only tool calls run in parallel; writes, edits, patches, and commands stay sequential.
 - Context use is approximate when the endpoint does not report usage, and compaction depends on the model producing a usable summary. `/compact` is the manual escape hatch.
 - Markdown support covers the common subset; tables, images, and syntax highlighting are shown as plain text.

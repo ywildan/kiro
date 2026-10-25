@@ -16,7 +16,16 @@ export interface MockUsage {
 }
 
 export type MockTurn =
-  | { type: 'text'; text: string; chunkSize?: number; delayMs?: number; usage?: MockUsage; finishReason?: string }
+  | {
+      type: 'text';
+      text: string;
+      /** Emitted as reasoning_content deltas before the visible text. */
+      reasoning?: string;
+      chunkSize?: number;
+      delayMs?: number;
+      usage?: MockUsage;
+      finishReason?: string;
+    }
   | {
       type: 'tool-calls';
       text?: string;
@@ -229,6 +238,18 @@ export async function createMockServer(options: MockServerOptions = {}): Promise
     send({ id: 'mock', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] });
 
     if (turn.type === 'text') {
+      if (turn.reasoning) {
+        for (const piece of splitChunks(turn.reasoning, chunkSize)) {
+          if (!res.destroyed) {
+            send({
+              choices: [
+                { index: 0, delta: { reasoning_content: piece }, finish_reason: null },
+              ],
+            });
+          }
+          if (delayMs) await sleep(delayMs);
+        }
+      }
       for (const piece of splitChunks(turn.text, chunkSize)) {
         if (!res.destroyed) {
           send({ choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] });

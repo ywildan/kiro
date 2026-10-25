@@ -41,6 +41,8 @@ export interface TokenUsage {
 
 export type ProviderEvent =
   | { type: 'text'; text: string }
+  /** Live reasoning/thinking text from reasoning models (R1, o-series, QwQ, …). */
+  | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; toolCall: ToolCall }
   | { type: 'usage'; usage: TokenUsage }
   /** The provider's finish_reason for the choice, e.g. "stop", "tool_calls", "length". */

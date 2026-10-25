@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput, useStdin } from 'ink';
 import type { ViewItem } from './types.js';
-import { MAX_EXPANDED_TOOL_CHARS } from './types.js';
+import { MAX_EXPANDED_TOOL_CHARS, MAX_REASONING_CHARS } from './types.js';
 import { renderMarkdown, type MarkdownSegment } from './markdown.js';
 import { parseMouseWheel } from './mouse.js';
 import {
@@ -42,6 +42,14 @@ interface RenderLine {
 
 function blankLine(): RenderLine {
   return { prefix: '', text: '' };
+}
+
+/** Keeps head and tail of a long reasoning trace so the newest thinking stays visible. */
+function clampReasoning(text: string): string {
+  if (text.length <= MAX_REASONING_CHARS) return text;
+  const head = Math.floor(MAX_REASONING_CHARS * 0.4);
+  const tail = MAX_REASONING_CHARS - head;
+  return `${text.slice(0, head)}\n… [earlier reasoning omitted] …\n${text.slice(-tail)}`;
 }
 
 function block(
@@ -177,6 +185,23 @@ function itemLines(item: ViewItem, width: number, expandedToolId: number | null)
       }));
       lines.push(blankLine());
       return lines;
+    }
+    case 'reasoning': {
+      const header: RenderLine[] = [
+        {
+          prefix: '◔ ',
+          prefixColor: 'magenta',
+          text: item.draft ? 'thinking…' : 'reasoning (done, not saved)',
+          dim: true,
+        },
+      ];
+      // Collapse finished traces: they are display-only, and leaving every
+      // reasoning block expanded floods the transcript in long tool loops.
+      if (item.draft) {
+        header.push(...block(clampReasoning(item.text), '  · ', '  · ', width - 2, { dim: true }));
+      }
+      header.push(blankLine());
+      return header;
     }
     case 'tool':
       return toolLines(item, width, item.id === expandedToolId);

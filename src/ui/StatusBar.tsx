@@ -15,6 +15,8 @@ interface StatusBarProps {
   cwd: string;
   activity: Activity;
   toolName?: string;
+  /** Number of messages typed during a turn, waiting to run. */
+  queued?: number;
   yolo?: boolean;
   autoAllowed?: string[];
   contextTokens?: number;
@@ -37,6 +39,7 @@ export function StatusBar({
   cwd,
   activity,
   toolName,
+  queued,
   yolo = false,
   autoAllowed = [],
   contextTokens,
@@ -64,6 +67,7 @@ export function StatusBar({
   const stateColor =
     activity === 'cancelling' ? 'red' : activity === null ? 'green' : 'yellow';
   const spinner = busy ? `${SPINNER[frame] ?? '⠋'} ` : '';
+  const queueNote = queued ? `${queued} queued · ` : '';
   const badge = yolo
     ? 'YOLO'
     : autoAllowed.length > 0
@@ -72,7 +76,7 @@ export function StatusBar({
   const badgeWidth = badge === '' ? 0 : displayWidth(badge) + 2;
   // The bar is indented to line up with the chat text, so budgets use the inner width.
   const innerWidth = Math.max(10, width - 2);
-  const state = `${spinner}${stateText}`;
+  const state = `${spinner}${queueNote}${stateText}`;
   const stateBudget = Math.max(4, Math.max(10, Math.floor(innerWidth / 2)) - badgeWidth);
   const stateShown = truncateToWidth(state, stateBudget);
   const restBudget = Math.max(0, innerWidth - badgeWidth - displayWidth(stateShown) - 2 - 6);

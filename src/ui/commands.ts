@@ -11,6 +11,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/compact', description: 'summarize older turns to free context' },
   { name: '/sessions', description: 'list saved sessions for this directory' },
   { name: '/resume', usage: '<n | id>', description: 'resume a saved session' },
+  { name: '/undo', description: 'revert the last file change Kiro made (write/edit/patch)' },
   { name: '/clear', description: 'start a new session' },
   { name: '/export', usage: '[file]', description: 'write the transcript to a Markdown file' },
   { name: '/mouse', description: 'toggle mouse reporting (wheel scroll vs text selection)' },

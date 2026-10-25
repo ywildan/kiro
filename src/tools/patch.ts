@@ -5,6 +5,7 @@ import { applyPatch as applyUnified, parsePatch, type StructuredPatch } from 'di
 import type { ApprovalRequest, Tool } from './types.js';
 import { denied, ok, requestApproval, toolError } from './types.js';
 import { buildDiff } from './diff.js';
+import { snapshotBeforeMutation } from './checkpoint.js';
 import { MAX_FILE_BYTES, resolvePath, stringArg } from './paths.js';
 
 const MAX_PATCH_CHARS = 1_000_000;
@@ -184,6 +185,11 @@ const applyPatchTool: Tool = {
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');
+    await snapshotBeforeMutation(
+      ctx.cwd,
+      'apply_patch',
+      planned.map((file) => file.abs),
+    );
 
     const staged: { temp: string; target: string }[] = [];
     try {

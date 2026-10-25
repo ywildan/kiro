@@ -56,9 +56,11 @@ import { MOUSE_OFF, MOUSE_ON } from './mouse.js';
 import { ModelPicker, type ModelRefreshResult } from './ModelPicker.js';
 import { withProfileModel, withProfileModels } from './model-picker.js';
 import { formatProfileList } from './profile-list.js';
+import { loadPromptHistory, recordPrompt } from './prompt-history.js';
 import { StatusBar, type Activity } from './StatusBar.js';
 import { summarizeToolArgs } from './text.js';
-import { MAX_EXPANDED_TOOL_CHARS, type ViewItem } from './types.js';
+import { undoLastCheckpoint } from '../tools/checkpoint.js';
+import { MAX_EXPANDED_TOOL_CHARS, MAX_REASONING_CHARS, type ViewItem } from './types.js';
 
 export interface StartupNotice {
   level: 'info' | 'error' | 'muted';
@@ -203,6 +205,11 @@ export function App({
   const pendingResolverRef = useRef<((decision: ApprovalDecision) => void) | null>(null);
 
   const textBufferRef = useRef('');
+  const queuedRef = useRef<string[]>([]);
+  const [queuedCount, setQueuedCount] = useState(0);
+  const [promptHistory, setPromptHistory] = useState<string[]>([]);
+  const handleSubmitRef = useRef<((value: string, fromQueue?: boolean) => void) | null>(null);
+  const drainQueueRef = useRef<(() => void) | null>(null);
   const flushTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const addNotice = useCallback((level: 'info' | 'error' | 'muted', text: string): void => {
@@ -416,6 +423,7 @@ export function App({
         wizardCancelRequestedRef.current = false;
         transitioningRef.current = false;
         setWizardActive(false);
+        drainQueueRef.current?.();
       }
     },
     [addNotice, finishWizardPrompt, persistConfig, wizardUi],
@@ -512,6 +520,16 @@ export function App({
     });
   }, []);
 
+  /** Marks live "thinking…" items finished; reasoning is display-only and not saved. */
+  const finalizeReasoning = useCallback((): void => {
+    setItems((current) => {
+      if (!current.some((item) => item.kind === 'reasoning' && item.draft)) return current;
+      return current.map((item) =>
+        item.kind === 'reasoning' && item.draft ? { ...item, draft: false } : item,
+      );
+    });
+  }, []);
+
   const resolveApproval = useCallback((decision: ApprovalDecision): void => {
     const request = pendingApprovalRef.current;
     const resolver = pendingResolverRef.current;
@@ -549,7 +567,7 @@ export function App({
   }, [approvalPolicy]);
 
   const sendTurn = useCallback(
-    async (rawInput: string): Promise<void> => {
+    async (rawInput: string, alreadyDisplayed = false): Promise<void> => {
       if (busyRef.current || transitioningRef.current) return;
       const text = rawInput.trim();
       if (!text) return;
@@ -559,11 +577,14 @@ export function App({
       setBusy(true);
       setCancelling(false);
       setActiveTool(null);
-      setItems((current) => [
-        ...current,
-        { kind: 'user', id: nextItemIdRef.current++, text },
-      ]);
+      if (!alreadyDisplayed) {
+        setItems((current) => [
+          ...current,
+          { kind: 'user', id: nextItemIdRef.current++, text },
+        ]);
+      }
       messagesRef.current.push({ role: 'user', content: text });
+      void recordPrompt(cwd, text).then(setPromptHistory);
       recomputeContext();
       void persistSession();
 
@@ -593,15 +614,39 @@ export function App({
         })) {
           switch (event.type) {
             case 'text':
+              flushText();
+              finalizeReasoning();
               queueText(event.text);
               break;
+            case 'reasoning': {
+              flushText();
+              setItems((current) => {
+                const last = current[current.length - 1];
+                if (last?.kind === 'reasoning' && last.draft) {
+                  // Append live; MessageList clamps the rendered size.
+                  return [...current.slice(0, -1), { ...last, text: (last.text + event.text).slice(-MAX_REASONING_CHARS) }];
+                }
+                return [
+                  ...current,
+                  {
+                    kind: 'reasoning',
+                    id: nextItemIdRef.current++,
+                    text: event.text,
+                    draft: true,
+                  },
+                ];
+              });
+              break;
+            }
             case 'assistant':
               flushText();
+              finalizeReasoning();
               finalizeAssistant(event.content);
               recomputeContext();
               break;
             case 'tool-start':
               flushText();
+              finalizeReasoning();
               setActiveTool(event.toolCall.function.name);
               setItems((current) => [
                 ...current,
@@ -654,6 +699,7 @@ export function App({
               break;
             case 'done':
               flushText();
+              finalizeReasoning();
               recomputeContext();
               if (event.reason === 'aborted') {
                 addNotice('info', 'Turn cancelled.');
@@ -663,9 +709,11 @@ export function App({
         }
       } catch (error) {
         flushText();
+        finalizeReasoning();
         addNotice('error', error instanceof Error ? error.message : String(error));
       } finally {
         flushText();
+        finalizeReasoning();
         abortRef.current = null;
         busyRef.current = false;
         setBusy(false);
@@ -674,6 +722,15 @@ export function App({
         if (pendingApprovalRef.current) resolveApproval('deny');
         recomputeContext();
         void persistSession();
+        if (!quittingRef.current) {
+          if (cancelRequestedRef.current && queuedRef.current.length > 0) {
+            queuedRef.current = [];
+            setQueuedCount(0);
+            addNotice('muted', 'Queued messages were discarded after the cancel.');
+          }
+          // Messages typed while the agent was working run next, like a chat queue.
+          drainQueueRef.current?.();
+        }
       }
     },
     [
@@ -1157,6 +1214,34 @@ export function App({
           );
           return;
         }
+        case '/undo': {
+          if (argument) {
+            addNotice('error', 'Usage: /undo (reverts the last file change; run again to step back)');
+            return;
+          }
+          try {
+            const result = await undoLastCheckpoint(cwd);
+            if (!result) {
+              addNotice('muted', 'Nothing to undo yet: records start with the first write, edit, or patch Kiro performs.');
+              return;
+            }
+            const reverted = [...result.restored, ...result.deleted];
+            addNotice(
+              'info',
+              `Reverted ${reverted.length} file${reverted.length === 1 ? '' : 's'} from ${result.tool}: ` +
+                [
+                  ...result.restored.map((p) => `restored ${p}`),
+                  ...result.deleted.map((p) => `deleted ${p}`),
+                ].join(', '),
+            );
+          } catch (error) {
+            addNotice(
+              'error',
+              `/undo failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          return;
+        }
         case '/exit':
           quit();
           return;
@@ -1183,23 +1268,64 @@ export function App({
     ],
   );
 
+  /** Runs the next queued item once the app is idle, including queued slash commands. */
+  const drainQueue = useCallback((): void => {
+    if (
+      busyRef.current ||
+      transitioningRef.current ||
+      wizardActiveRef.current ||
+      quittingRef.current
+    ) {
+      return;
+    }
+    const next = queuedRef.current.shift();
+    setQueuedCount(queuedRef.current.length);
+    if (!next) return;
+    if (next.startsWith('/')) {
+      void handleCommand(next).finally(() => drainQueueRef.current?.());
+      return;
+    }
+    handleSubmitRef.current?.(next, true);
+  }, [handleCommand]);
+  drainQueueRef.current = drainQueue;
+
   const handleSubmit = useCallback(
-    (value: string): void => {
+    (value: string, fromQueue = false): void => {
       if (wizardResolveRef.current || wizardPromptRef.current) {
         finishWizardPrompt(value);
         return;
       }
-      if (wizardActiveRef.current || transitioningRef.current) return;
       const trimmed = value.trim();
       if (!trimmed) return;
+      if (wizardActiveRef.current || transitioningRef.current) {
+        // The wizard owns the keyboard; ignore stray input.
+        return;
+      }
+      if (busyRef.current && !fromQueue) {
+        // Type-ahead: the message runs as soon as the current turn finishes.
+        queuedRef.current.push(trimmed);
+        setQueuedCount(queuedRef.current.length);
+        if (!trimmed.startsWith('/')) {
+          setItems((current) => [
+            ...current,
+            { kind: 'user', id: nextItemIdRef.current++, text: trimmed },
+          ]);
+        }
+        addNotice(
+          'muted',
+          'Queued. It runs after the current turn; PgUp/PgDn still scrolls the transcript meanwhile.',
+        );
+        return;
+      }
       if (trimmed.startsWith('/')) {
-        void handleCommand(trimmed);
+        void handleCommand(trimmed).finally(() => drainQueueRef.current?.());
         return;
       }
       void sendTurn(trimmed);
     },
-    [finishWizardPrompt, handleCommand, sendTurn],
+    [addNotice, finishWizardPrompt, handleCommand, sendTurn],
   );
+  handleSubmitRef.current = handleSubmit;
 
   useEffect(() => {
     if (configCreated) {
@@ -1208,6 +1334,7 @@ export function App({
         `Created config template at ${configPath}. Set your endpoint, model, and API key.`,
       );
     }
+    void loadPromptHistory(cwd).then(setPromptHistory);
     const active = config.profiles[config.activeProfile];
     if (active) {
       if (active.type !== 'openai') {
@@ -1319,17 +1446,18 @@ export function App({
       ) : (
         <Input
           key={wizardPrompt?.id ?? 0}
-          disabled={busy}
+          disabled={false}
           width={width}
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
+          history={wizardPrompt || wizardActive ? undefined : promptHistory}
           placeholder={
             wizardPrompt
               ? wizardPrompt.defaultValue && !wizardPrompt.mask
                 ? `${wizardPrompt.label} [${wizardPrompt.defaultValue}]`
                 : wizardPrompt.label
               : busy
-                ? 'Kiro is working… Ctrl+C to cancel'
+                ? 'Kiro is working… type ahead, or Ctrl+C to cancel'
                 : wizardActive
                   ? 'Working… Esc to cancel'
                   : 'Ask Kiro to build or change something…'
@@ -1347,6 +1475,7 @@ export function App({
         cwd={cwd}
         activity={activity}
         toolName={activeTool ?? undefined}
+        queued={queuedCount > 0 ? queuedCount : undefined}
         yolo={yolo}
         autoAllowed={autoAllowed}
         contextTokens={contextTokens}

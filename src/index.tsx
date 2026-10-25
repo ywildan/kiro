@@ -13,6 +13,7 @@ import {
 import { loadEnvFile } from './env.js';
 import { runModelCli } from './model/cli.js';
 import { readLine } from './model/cli-ui.js';
+import { runHeadless } from './headless.js';
 import { registerSecretEnv } from './secrets.js';
 import { latestSession, loadSession, type SessionRecord } from './sessions.js';
 import { MOUSE_OFF } from './ui/mouse.js';
@@ -25,6 +26,7 @@ interface CliOptions {
   model?: string;
   continueSession: boolean;
   resume?: string;
+  prompt?: string;
   yolo: boolean;
   mouse: boolean;
   altScreen: boolean;
@@ -43,6 +45,10 @@ Options:
   --model <name>     Override the active profile's model name
   -c, --continue     Resume the most recent session for this directory
   --resume <id>      Resume a specific saved session
+  -p, --prompt <text>
+                     Run one turn without a TUI ("-" or no text reads the
+                     prompt from stdin); replies stream to stdout, notices
+                     and reasoning to stderr
   --yolo             Skip all approval prompts (use with care)
   --mouse            Mouse reporting is on by default: the wheel scrolls the
                      transcript, Shift+drag selects text for copying.
@@ -134,16 +140,33 @@ function parseArgs(argv: string[]): CliOptions {
     }
     const equals = arg.indexOf('=');
     const flag = equals === -1 ? arg : arg.slice(0, equals);
-    if (flag === '--profile' || flag === '--base-url' || flag === '--model' || flag === '--resume') {
+    if (
+      flag === '--profile' ||
+      flag === '--base-url' ||
+      flag === '--model' ||
+      flag === '--resume' ||
+      flag === '--prompt' ||
+      flag === '-p'
+    ) {
+      const isPrompt = flag === '--prompt' || flag === '-p';
       let value: string | undefined;
       if (equals !== -1) {
         value = arg.slice(equals + 1);
       } else {
-        value = argv[index + 1];
-        if (value !== undefined && !value.startsWith('-')) index++;
-        else value = undefined;
+        const next = argv[index + 1];
+        if (next !== undefined && (!next.startsWith('-') || (isPrompt && next === '-'))) {
+          value = next;
+          index++;
+        }
       }
-      if (!value) throw new UsageError(`Option ${flag} requires a value.`);
+      if (isPrompt) {
+        // Bare -p, -p with an empty value, and -p - all read the prompt from stdin.
+        options.prompt = value === undefined || value === '' || value === '-' ? '' : value;
+        continue;
+      }
+      if (value === undefined || value === '') {
+        throw new UsageError(`Option ${flag} requires a value.`);
+      }
       if (flag === '--profile') options.profile = value;
       else if (flag === '--base-url') options.baseUrl = value;
       else if (flag === '--model') options.model = value;
@@ -197,8 +220,10 @@ async function main(): Promise<void> {
     process.stdout.write(`Kiro ${VERSION}\n`);
     return;
   }
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  const headless = options.prompt !== undefined;
+  if (!headless && (!process.stdin.isTTY || !process.stdout.isTTY)) {
     console.error('Kiro needs an interactive terminal (stdin and stdout must be TTYs).');
+    console.error('For scripts and CI, run one turn with: kiro -p "your prompt"');
     process.exitCode = 2;
     return;
   }
@@ -233,8 +258,38 @@ async function main(): Promise<void> {
     }
   }
 
+  if (headless) {
+    if (options.resume && options.continueSession) {
+      console.error('Kiro: both --resume and --continue were given with -p; --resume wins.');
+    }
+    const controller = new AbortController();
+    const onInterrupt = (): void => controller.abort();
+    process.once('SIGINT', onInterrupt);
+    try {
+      process.exitCode = await runHeadless({
+        config,
+        cwd: process.cwd(),
+        // An empty -p value means "read the prompt from stdin".
+        prompt: options.prompt || undefined,
+        yolo: options.yolo,
+        resumeId: options.resume,
+        continueLatest: !options.resume && options.continueSession,
+        signal: controller.signal,
+      });
+    } finally {
+      process.off('SIGINT', onInterrupt);
+    }
+    return;
+  }
+
   let initialSession: SessionRecord | null = null;
   const startupNotices: StartupNotice[] = [];
+  if (options.resume && options.continueSession) {
+    startupNotices.push({
+      level: 'info',
+      text: 'Both --resume and --continue were given; resuming the requested session.',
+    });
+  }
   if (backup) {
     startupNotices.push({
       level: 'info',

@@ -20,6 +20,8 @@ interface InputProps {
   mask?: boolean;
   allowEmpty?: boolean;
   slashMenu?: boolean;
+  /** Submitted prompts, oldest first; ↑/↓ recall them when the input is empty. */
+  history?: string[];
   onSubmit(value: string): void;
   onCancel?(): void;
   onMenuRowsChange?(rows: number): void;
@@ -32,6 +34,7 @@ export function Input({
   mask = false,
   allowEmpty = false,
   slashMenu = true,
+  history,
   onSubmit,
   onCancel,
   onMenuRowsChange,
@@ -39,10 +42,18 @@ export function Input({
   const { stdin } = useStdin();
   const [state, setState] = useState<TextInputState>({ chars: [], cursor: 0 });
   const [selected, setSelected] = useState(0);
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
 
   const text = state.chars.join('');
+  const recalled = historyIndex !== null ? (history?.[historyIndex] ?? null) : null;
+  useEffect(() => {
+    // Editing the recalled entry (or pressing a letter) ends history browsing.
+    if (historyIndex !== null && text !== recalled) {
+      setHistoryIndex(null);
+    }
+  }, [historyIndex, recalled, text]);
   const matches =
     slashMenu && !mask && !disabled ? filterSlashCommands(text) : [];
   const menuOpen = matches.length > 0;
@@ -139,6 +150,37 @@ export function Input({
           const command = matches[activeIndex]!.name;
           const filled = Array.from(`${command} `);
           update(filled, filled.length);
+          return;
+        }
+      }
+      if (!mask && history && history.length > 0) {
+        if (key.upArrow) {
+          // History recall starts from an empty prompt: ↑ steps backwards
+          // through submitted prompts, ↓ leaves history again.
+          if (historyIndex === null) {
+            if (chars.length > 0) return;
+            setHistoryIndex(history.length - 1);
+            const value = history[history.length - 1] ?? '';
+            update(Array.from(value), value.length);
+            return;
+          }
+          if (historyIndex > 0) {
+            setHistoryIndex(historyIndex - 1);
+            const value = history[historyIndex - 1] ?? '';
+            update(Array.from(value), value.length);
+          }
+          return;
+        }
+        if (key.downArrow && historyIndex !== null) {
+          const next = historyIndex + 1;
+          if (next >= history.length) {
+            setHistoryIndex(null);
+            update([], 0);
+          } else {
+            setHistoryIndex(next);
+            const value = history[next] ?? '';
+            update(Array.from(value), value.length);
+          }
           return;
         }
       }

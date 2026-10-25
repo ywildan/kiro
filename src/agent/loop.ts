@@ -34,6 +34,7 @@ export function planToolBatches(calls: ToolCall[]): ToolBatch[] {
 export type AgentEvent =
   | { type: 'text'; text: string }
   | { type: 'assistant'; content: string }
+  | { type: 'reasoning'; text: string }
   | { type: 'tool-start'; toolCall: ToolCall }
   | { type: 'tool-end'; toolCall: ToolCall; result: ToolResult; durationMs: number }
   | { type: 'usage'; usage: TokenUsage }
@@ -131,6 +132,8 @@ export async function* runAgentTurn(options: RunTurnOptions): AsyncGenerator<Age
           toolCalls.push(event.toolCall);
         } else if (event.type === 'usage') {
           yield { type: 'usage', usage: event.usage };
+        } else if (event.type === 'reasoning') {
+          yield { type: 'reasoning', text: event.text };
         } else if (event.type === 'finish') {
           finishReason = event.reason;
         } else if (event.type === 'notice') {

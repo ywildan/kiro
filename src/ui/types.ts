@@ -23,6 +23,17 @@ export interface AssistantItem {
   draft?: boolean;
 }
 
+/** Live model reasoning (thinking traces). Shown in the transcript, not stored in the session. */
+export interface ReasoningItem {
+  kind: 'reasoning';
+  id: number;
+  text: string;
+  draft: boolean;
+}
+
+/** Bound the live reasoning buffer so a chatty reasoning model cannot flood the layout. */
+export const MAX_REASONING_CHARS = 8_000;
+
 export interface ToolItem {
   kind: 'tool';
   id: number;
@@ -43,4 +54,10 @@ export interface NoticeItem {
   text: string;
 }
 
-export type ViewItem = BannerItem | UserItem | AssistantItem | ToolItem | NoticeItem;
+export type ViewItem =
+  | BannerItem
+  | UserItem
+  | AssistantItem
+  | ReasoningItem
+  | ToolItem
+  | NoticeItem;

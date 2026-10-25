@@ -12,6 +12,7 @@ import {
   type ToolContext,
 } from './types.js';
 import { buildDiff } from './diff.js';
+import { snapshotBeforeMutation } from './checkpoint.js';
 import {
   booleanArg,
   integerArg,
@@ -231,6 +232,7 @@ const writeFileTool: Tool = {
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');
+    await snapshotBeforeMutation(ctx.cwd, 'write_file', [resolved.abs]);
 
     await mkdir(path.dirname(resolved.abs), { recursive: true });
     await writeFile(resolved.abs, content, 'utf8');
@@ -428,6 +430,7 @@ const editFileTool: Tool = {
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');
+    await snapshotBeforeMutation(ctx.cwd, 'edit_file', [resolved.abs]);
 
     await writeFile(resolved.abs, updated, 'utf8');
     const change = `+${preview.added} -${preview.removed}`;
@@ -517,6 +520,7 @@ const multiEditTool: Tool = {
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');
+    await snapshotBeforeMutation(ctx.cwd, 'multi_edit', [resolved.abs]);
 
     await writeFile(resolved.abs, updated, 'utf8');
     const change = `+${preview.added} -${preview.removed}`;

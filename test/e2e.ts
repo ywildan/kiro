@@ -68,7 +68,7 @@ import {
   type ModelWizardUi,
   type TextPrompt,
 } from '../src/model/wizard.js';
-import { OpenAIProvider, isOverflowMessage } from '../src/providers/openai.js';
+import { OpenAIProvider, isOverflowMessage, reasoningModel, rejectsMaxTokens } from '../src/providers/openai.js';
 import type {
   ChatMessage,
   Provider,
@@ -110,6 +110,8 @@ import { renderMarkdown } from '../src/ui/markdown.js';
 import { MOUSE_SCROLL_LINES, isMouseSequence, parseMouseWheel } from '../src/ui/mouse.js';
 import { StatusBar } from '../src/ui/StatusBar.js';
 import { buildResumedView } from '../src/ui/history.js';
+import { loadPromptHistory, recordPrompt, rememberPrompt } from '../src/ui/prompt-history.js';
+import { snapshotBeforeMutation, undoLastCheckpoint } from '../src/tools/checkpoint.js';
 import {
   applyInputOps,
   displayWidth,
@@ -2794,6 +2796,326 @@ async function main(): Promise<void> {
     assert.ok(expanded.some((line) => line.includes('third line')));
     assert.ok(expanded.some((line) => line.includes('Ctrl+O to collapse')));
     assert.deepEqual(buildLines(items, 80, 8), buildLines(items, 80));
+  });
+
+  await test('reasoning models get max_completion_tokens and rejected max_tokens recovers', async () => {
+    assert.equal(reasoningModel('o1'), true);
+    assert.equal(reasoningModel('o3-mini'), true);
+    assert.equal(reasoningModel('gpt-5.2'), true);
+    assert.equal(reasoningModel('gpt-4o'), false);
+    assert.equal(
+      rejectsMaxTokens("Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead."),
+      true,
+    );
+    assert.equal(rejectsMaxTokens('Incorrect API key provided'), false);
+
+    const direct = await createMockServer({ turns: [{ type: 'text', text: 'ok' }] });
+    const reasoningProvider = new OpenAIProvider(
+      {
+        type: 'openai',
+        baseUrl: direct.url,
+        model: 'o3-mini',
+        apiKeyEnv: 'MOCK_KEY',
+        temperature: 0.2,
+        maxTokens: 512,
+      },
+      'test-key',
+    );
+    await collect(reasoningProvider.stream([{ role: 'user', content: 'hi' }], []));
+    const directBody = direct.requests[0]?.body ?? {};
+    assert.equal(directBody.max_completion_tokens, 512);
+    assert.equal(directBody.max_tokens, undefined);
+    assert.equal(directBody.temperature, undefined, 'o-series must keep the default temperature');
+    await direct.close();
+
+    const fallback = await createMockServer({
+      turns: [
+        {
+          type: 'http-error',
+          status: 400,
+          body: JSON.stringify({
+            error: {
+              message:
+                "Unsupported parameter: 'max_tokens' is not supported with this model. " +
+                "Use 'max_completion_tokens' instead.",
+            },
+          }),
+        },
+        { type: 'text', text: 'recovered' },
+      ],
+    });
+    try {
+      const events = await collect(makeProvider(fallback.url).stream([{ role: 'user', content: 'hi' }], []));
+      assert.equal(fallback.requests.length, 2);
+      assert.equal(fallback.requests[0]?.body.max_tokens, 1024);
+      assert.equal(fallback.requests[1]?.body.max_tokens, undefined);
+      assert.equal(fallback.requests[1]?.body.max_completion_tokens, 1024);
+      assert.equal(fallback.requests[1]?.body.temperature, undefined);
+      assert.ok(
+        events.some((event) => event.type === 'notice' && /max_completion_tokens/.test(event.message)),
+      );
+      assert.ok(
+        events
+          .filter((event) => event.type === 'text')
+          .map((event) => event.text)
+          .join('')
+          .includes('recovered'),
+      );
+    } finally {
+      await fallback.close();
+    }
+  });
+
+  await test('reasoning traces stream through the agent and collapse once finished', async () => {
+    const cwd = await tempDir();
+    const scenario = await runScenario({
+      cwd,
+      turns: [{ type: 'text', reasoning: 'Weigh the options. ', text: 'Here is the answer.' }],
+    });
+    try {
+      const reasoning = scenario.events
+        .filter((event): event is Extract<AgentEvent, { type: 'reasoning' }> => event.type === 'reasoning')
+        .map((event) => event.text)
+        .join('');
+      assert.equal(reasoning, 'Weigh the options. ');
+      assert.ok(
+        scenario.events
+          .filter((event) => event.type === 'text')
+          .map((event) => event.text)
+          .join('')
+          .includes('Here is the answer.'),
+      );
+      assert.equal(scenario.messages.at(-1)?.content, 'Here is the answer.');
+    } finally {
+      await scenario.mock.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+
+    const live = buildLines(
+      [{ kind: 'reasoning', id: 1, text: 'Weigh the options.', draft: true }],
+      80,
+    )
+      .map((line) => `${line.prefix}${line.text}`)
+      .join('\n');
+    assert.match(live, /thinking…/);
+    assert.match(live, /Weigh the options\./);
+
+    const finished = buildLines(
+      [{ kind: 'reasoning', id: 2, text: 'Weigh the options.', draft: false }],
+      80,
+    )
+      .map((line) => `${line.prefix}${line.text}`)
+      .join('\n');
+    assert.match(finished, /reasoning \(done, not saved\)/);
+    assert.ok(!finished.includes('Weigh the options.'), 'finished traces collapse out of the way');
+  });
+
+  await test('a stream that stalls without bytes times out', async () => {
+    const mock = await createMockServer({ turns: [{ type: 'hang' }] });
+    const previousIdle = process.env.KIRO_STREAM_IDLE_MS;
+    const previousRetry = process.env.KIRO_RETRY_BASE_MS;
+    process.env.KIRO_STREAM_IDLE_MS = '40';
+    process.env.KIRO_RETRY_BASE_MS = '1';
+    try {
+      await assert.rejects(
+        collect(makeProvider(mock.url).stream([{ role: 'user', content: 'hi' }], [])),
+        /idle for more than|stalled without sending data/,
+      );
+    } finally {
+      if (previousIdle === undefined) delete process.env.KIRO_STREAM_IDLE_MS;
+      else process.env.KIRO_STREAM_IDLE_MS = previousIdle;
+      if (previousRetry === undefined) delete process.env.KIRO_RETRY_BASE_MS;
+      else process.env.KIRO_RETRY_BASE_MS = previousRetry;
+      await mock.close();
+    }
+  });
+
+  await test('checkpoints undo edits and creations without inlining file content', async () => {
+    const cwd = await tempDir();
+    const store = await tempDir('kiro-checkpoints-');
+    const previous = process.env.KIRO_CHECKPOINTS_DIR;
+    process.env.KIRO_CHECKPOINTS_DIR = store;
+    try {
+      const file = path.join(cwd, 'notes.txt');
+      await writeFile(file, 'old content\n');
+      await snapshotBeforeMutation(cwd, 'write_file', [file]);
+      await writeFile(file, 'new content\n');
+
+      const created = path.join(cwd, 'created.txt');
+      await snapshotBeforeMutation(cwd, 'write_file', [created]);
+      await writeFile(created, 'fresh\n');
+
+      const projectKey = (await readdir(store))[0]!;
+      const manifestPath = path.join(store, projectKey, 'manifest.json');
+      const manifestText = await readFile(manifestPath, 'utf8');
+      assert.ok(
+        !manifestText.includes('old content'),
+        'the manifest should reference backups instead of inlining file content',
+      );
+      const manifest = JSON.parse(manifestText) as {
+        entries: { files: { backup: string | null }[] }[];
+      };
+      assert.equal(manifest.entries.length, 2);
+      assert.ok(manifest.entries[0]!.files[0]!.backup, 'an existing file gets a backup');
+      assert.equal(manifest.entries[1]!.files[0]!.backup, null, 'a created file has no backup');
+
+      const undoCreated = await undoLastCheckpoint(cwd);
+      assert.equal(undoCreated?.tool, 'write_file');
+      assert.deepEqual(undoCreated?.deleted, [created]);
+      assert.equal(await fileExists(created), false);
+
+      const undoEdit = await undoLastCheckpoint(cwd);
+      assert.deepEqual(undoEdit?.restored, [file]);
+      assert.equal(await readFile(file, 'utf8'), 'old content\n');
+
+      assert.equal(await undoLastCheckpoint(cwd), null, 'undo steps back until it runs out');
+    } finally {
+      if (previous === undefined) delete process.env.KIRO_CHECKPOINTS_DIR;
+      else process.env.KIRO_CHECKPOINTS_DIR = previous;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(store, { recursive: true, force: true });
+    }
+  });
+
+  await test('prompt history dedupes, stays bounded, and redacts registered keys', async () => {
+    const cwd = await tempDir();
+    const store = await tempDir('kiro-history-');
+    const previous = process.env.KIRO_HISTORY_DIR;
+    process.env.KIRO_HISTORY_DIR = store;
+    const secretName = 'KIRO_HISTORY_TEST_KEY';
+    const secretValue = 'sk-history-secret-9876';
+    process.env[secretName] = secretValue;
+    registerSecretEnv(secretName, secretValue, true);
+    try {
+      assert.deepEqual(rememberPrompt([], 'first'), ['first']);
+      assert.deepEqual(rememberPrompt(['first'], 'first'), ['first']);
+      assert.deepEqual(rememberPrompt(['first', 'second'], 'first'), ['second', 'first']);
+      assert.deepEqual(rememberPrompt(['keep'], '  spaced  '), ['keep', 'spaced']);
+
+      const many = Array.from({ length: 210 }, (_, index) => `prompt ${index}`);
+      const capped = rememberPrompt(many, 'latest');
+      assert.equal(capped.length, 200);
+      assert.equal(capped[0], 'prompt 11');
+      assert.equal(capped.at(-1), 'latest');
+
+      await recordPrompt(cwd, `use ${secretValue} carefully`);
+      await recordPrompt(cwd, 'second prompt');
+      await recordPrompt(cwd, 'use [REDACTED] carefully');
+      const history = await loadPromptHistory(cwd);
+      assert.deepEqual(history, ['second prompt', 'use [REDACTED] carefully']);
+
+      const files = await readdir(store);
+      assert.equal(files.length, 1);
+      const stored = await readFile(path.join(store, files[0]!), 'utf8');
+      assert.ok(!stored.includes(secretValue), 'key material must never reach prompt history');
+      await assertPrivateMode(path.join(store, files[0]!), 0o600);
+    } finally {
+      delete process.env[secretName];
+      clearSecrets();
+      if (previous === undefined) delete process.env.KIRO_HISTORY_DIR;
+      else process.env.KIRO_HISTORY_DIR = previous;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(store, { recursive: true, force: true });
+    }
+  });
+
+  await test('headless -p runs tools, streams text, and accepts piped prompts', async () => {
+    const mock = await createMockServer({
+      turns: [
+        {
+          type: 'tool-calls',
+          calls: [
+            {
+              name: 'write_file',
+              arguments: { path: 'headless.txt', content: 'from headless\n' },
+            },
+          ],
+        },
+        { type: 'text', text: 'All done.' },
+      ],
+    });
+    const dir = await tempDir('kiro-headless-');
+    const project = path.join(dir, 'project');
+    await mkdir(project);
+    const configFile = path.join(dir, 'config.json');
+    const envFile = path.join(dir, '.env');
+    await writeFile(
+      configFile,
+      JSON.stringify({
+        activeProfile: 'mock',
+        profiles: {
+          mock: {
+            type: 'openai',
+            baseUrl: mock.url,
+            model: 'mock-model',
+            apiKeyEnv: 'KIRO_HEADLESS_KEY',
+            temperature: 0,
+            maxTokens: 1024,
+          },
+        },
+      }),
+    );
+    await writeFile(envFile, 'KIRO_HEADLESS_KEY=test-key\n');
+    const env = {
+      ...process.env,
+      KIRO_CONFIG_PATH: configFile,
+      KIRO_ENV_PATH: envFile,
+      KIRO_SESSIONS_DIR: path.join(dir, 'sessions'),
+      KIRO_CHECKPOINTS_DIR: path.join(dir, 'checkpoints'),
+      KIRO_HISTORY_DIR: path.join(dir, 'history'),
+      KIRO_STREAM_IDLE_MS: '5000',
+      HOME: dir,
+    };
+    const cliPath = path.join(process.cwd(), 'src', 'index.tsx');
+    const tsxCli = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const runCli = (
+      args: string[],
+      input?: string,
+    ): Promise<{ status: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [tsxCli, cliPath, ...args], {
+          cwd: project,
+          env,
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (chunk: string) => {
+          stdout += chunk;
+        });
+        child.stderr.on('data', (chunk: string) => {
+          stderr += chunk;
+        });
+        child.on('error', reject);
+        child.on('close', (status) => resolve({ status, stdout, stderr }));
+        if (input !== undefined) child.stdin.end(input);
+      });
+    try {
+      const first = await runCli(['-p', 'Create the file.', '--yolo']);
+      assert.equal(first.status, 0, first.stderr);
+      assert.match(first.stdout, /All done\./);
+      assert.ok(first.stdout.endsWith('\n'), 'headless output ends with a newline');
+      assert.match(first.stderr, /write_file/);
+      assert.equal(await readFile(path.join(project, 'headless.txt'), 'utf8'), 'from headless\n');
+      const saved = await readdir(env.KIRO_SESSIONS_DIR, { recursive: true });
+      assert.ok(
+        saved.some((entry) => entry.endsWith('.json')),
+        'headless runs persist a session like the TUI',
+      );
+
+      const piped = await runCli(['-p', '-', '--yolo'], 'Say hello.');
+      assert.equal(piped.status, 0, piped.stderr);
+      assert.match(piped.stdout, /All done\./);
+
+      const noTty = await runCli([]);
+      assert.equal(noTty.status, 2);
+      assert.match(noTty.stderr, /interactive terminal/);
+      assert.match(noTty.stderr, /-p/);
+    } finally {
+      await mock.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   await test('the model wizard redraws one screen instead of piling up history', async () => {

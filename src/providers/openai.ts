@@ -14,6 +14,7 @@ import { ProviderError } from './types.js';
 const MAX_RETRIES = 3;
 const DEFAULT_RETRY_BASE_MS = 500;
 const MAX_RETRY_DELAY_MS = 60_000;
+const DEFAULT_STREAM_IDLE_MS = 120_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -87,6 +88,29 @@ export function isOverflowMessage(message: string): boolean {
   return OVERFLOW_PATTERN.test(message);
 }
 
+/** Reasoning-tuned models that only accept max_completion_tokens and default temperature. */
+export function reasoningModel(model: string): boolean {
+  return /^(o[134](-|$)|o\d{3,}|gpt-5)/i.test(model);
+}
+
+/** Matches endpoints whose 4xx error explicitly names the required parameter. */
+export function rejectsMaxTokens(message: string): boolean {
+  return /max_completion_tokens/.test(message) && /max_tokens/.test(message);
+}
+
+/** Reads the standard reasoning fields used by R1-style and OpenRouter endpoints. */
+function extractReasoning(source: unknown): string {
+  if (!isRecord(source)) return '';
+  if (typeof source.reasoning_content === 'string') return source.reasoning_content;
+  if (typeof source.reasoning === 'string') return source.reasoning;
+  if (Array.isArray(source.reasoning_details)) {
+    return source.reasoning_details
+      .map((detail) => (isRecord(detail) && typeof detail.text === 'string' ? detail.text : ''))
+      .join('');
+  }
+  return '';
+}
+
 interface PendingToolCall {
   id: string;
   name: string;
@@ -136,6 +160,12 @@ export class OpenAIProvider implements Provider {
   private readonly apiKey: string | undefined;
   private readonly temperature: number | undefined;
   private readonly maxTokens: number | undefined;
+  /**
+   * Reasoning-tuned OpenAI models (o1/o3/o4, gpt-5) reject `max_tokens` and
+   * non-default `temperature`; they take `max_completion_tokens` instead.
+   * Guessed from the model id, then renegotiated on the endpoint's own error.
+   */
+  private completionTokenStyle: 'chat' | 'completion';
 
   constructor(profile: ProfileConfig, apiKey: string | undefined) {
     this.baseUrl = profile.baseUrl;
@@ -143,6 +173,7 @@ export class OpenAIProvider implements Provider {
     this.apiKey = apiKey;
     this.temperature = profile.temperature;
     this.maxTokens = profile.maxTokens;
+    this.completionTokenStyle = reasoningModel(profile.model) ? 'completion' : 'chat';
   }
 
   async *stream(
@@ -180,9 +211,18 @@ export class OpenAIProvider implements Provider {
       body.tools = tools;
       body.tool_choice = 'auto';
     }
-    if (this.temperature !== undefined) body.temperature = this.temperature;
-    if (this.maxTokens !== undefined) body.max_tokens = this.maxTokens;
+    if (this.temperature !== undefined && this.completionTokenStyle === 'chat') {
+      body.temperature = this.temperature;
+    }
+    if (this.maxTokens !== undefined) {
+      if (this.completionTokenStyle === 'completion') {
+        body.max_completion_tokens = this.maxTokens;
+      } else {
+        body.max_tokens = this.maxTokens;
+      }
+    }
 
+    let renegotiatedTokenStyle = false;
     for (let attempt = 0; ; attempt++) {
       let emitted = 0;
       try {
@@ -193,6 +233,27 @@ export class OpenAIProvider implements Provider {
         return;
       } catch (error) {
         if (isAbortError(error) || options.signal?.aborted) throw error;
+        // Some endpoints reject the legacy max_tokens parameter: switch the key
+        // once and retry immediately without consuming a retry slot.
+        if (
+          !renegotiatedTokenStyle &&
+          error instanceof ProviderError &&
+          (error.status === 400 || error.status === 422) &&
+          rejectsMaxTokens(error.message)
+        ) {
+          renegotiatedTokenStyle = true;
+          this.completionTokenStyle = 'completion';
+          delete body.max_tokens;
+          if (this.maxTokens !== undefined) body.max_completion_tokens = this.maxTokens;
+          if (body.temperature !== undefined) {
+            delete body.temperature;
+          }
+          yield {
+            type: 'notice',
+            message: 'The endpoint rejected max_tokens; retrying with max_completion_tokens.',
+          };
+          continue;
+        }
         if (
           !(error instanceof ProviderError) ||
           !error.retryable ||
@@ -296,6 +357,8 @@ export class OpenAIProvider implements Provider {
       yield { type: 'finish', reason: choice.finish_reason };
     }
     const content = extractText(message.content);
+    const reasoning = extractReasoning(message);
+    if (reasoning) yield { type: 'reasoning', text: reasoning };
     if (content) yield { type: 'text', text: content };
     if (Array.isArray(message.tool_calls)) {
       const calls = new Map<number, PendingToolCall>();
@@ -352,6 +415,8 @@ export class OpenAIProvider implements Provider {
         events.push({ type: 'finish', reason: choice.finish_reason });
       }
       if (!isRecord(choice.delta)) return events;
+      const reasoning = extractReasoning(choice.delta);
+      if (reasoning) events.push({ type: 'reasoning', text: reasoning });
       const text = extractText(choice.delta.content);
       if (text) events.push({ type: 'text', text });
       if (Array.isArray(choice.delta.tool_calls)) {
@@ -373,9 +438,42 @@ export class OpenAIProvider implements Provider {
       return dataLines.length > 0 ? handleData(dataLines.join('\n')) : [];
     };
 
+    // The chat stream has no connect timeout: an endpoint that stalls without
+    // closing the socket would otherwise hang the TUI until Ctrl+C. The idle
+    // guard aborts the read when no byte arrives for KIRO_STREAM_IDLE_MS.
+    const idleMs = streamIdleMs();
+    const idleRead = async (): Promise<Awaited<ReturnType<typeof reader.read>>> => {
+      if (idleMs <= 0) return reader.read();
+      let inactivity: ReturnType<typeof setTimeout> | null = null;
+      try {
+        return await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            inactivity = setTimeout(() => {
+              // Reject before cancelling: cancel() resolves the pending read with
+              // done, and settling that first would swallow the timeout.
+              reject(
+                new ProviderError(
+                  `The model stream was idle for more than ${Math.round(
+                    idleMs / 1000,
+                  )}s. The endpoint stalled without sending data.\n` +
+                    'Adjust KIRO_STREAM_IDLE_MS (milliseconds, 0 disables) if this is expected.',
+                  undefined,
+                  { retryable: true },
+                ),
+              );
+              void reader.cancel().catch(() => undefined);
+            }, idleMs);
+          }),
+        ]);
+      } finally {
+        if (inactivity) clearTimeout(inactivity);
+      }
+    };
+
     try {
       while (!finished) {
-        const { value, done } = await reader.read();
+        const { value, done } = await idleRead();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
@@ -435,6 +533,12 @@ function isAbortError(error: unknown): boolean {
 function retryBaseMs(): number {
   const raw = Number(process.env.KIRO_RETRY_BASE_MS ?? '');
   return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_RETRY_BASE_MS;
+}
+
+/** Kill a stalled stream after this many milliseconds without a byte. 0 disables. */
+function streamIdleMs(): number {
+  const raw = Number(process.env.KIRO_STREAM_IDLE_MS ?? '');
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_STREAM_IDLE_MS;
 }
 
 /** Honors Retry-After (seconds or HTTP date), capped so a bad header cannot stall the TUI. */
