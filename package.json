@@ -1,6 +1,6 @@
 {
   "name": "@ywldan/kiro",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "A small terminal coding agent with your own OpenAI-compatible endpoint",
   "keywords": [
     "ai",
