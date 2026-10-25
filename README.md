@@ -280,13 +280,15 @@ Exit codes: `0` success, `1` model/tool/session error, `2` usage error (includin
 | `Ctrl+W` | Delete the previous word |
 | Left / Right / Home / End | Move the cursor |
 
-The status bar shows the active profile and model, the working directory, the context meter (`ctx 42k/128k`), the number of queued messages, and the current state (`ready`, `thinking…`, `retrying (n/3)…`, `running <tool>…`, `approval needed`, `cancelling…`). A long profile name is shortened in the middle, so the model and directory stay readable.
+The status bar shows the active profile and model, the working directory, the context meter (`ctx 42k/128k`), the number of queued messages, and the current state (`ready`, `thinking…`, `replying…`, `running <tool>…`, `approval needed`, `cancelling…`) with a spinner and the elapsed seconds for the current turn (`replying… · 12s`). A long profile name is shortened in the middle, so the model and directory stay readable.
 
 The input stays enabled while the agent works: type the next prompt and press Enter to queue it, and it runs as soon as the current turn ends. Queued prompts appear in the transcript right away, the status bar shows `N queued`, and Ctrl+C clears the queue together with the running turn. Slash commands typed while busy are queued the same way.
 
 Prompt history is stored per working directory in `~/.kiro/history/` (mode `0600`, up to 200 entries). With an empty input, `↑` recalls the most recent prompt, `↓` walks forward again, and editing the recalled text leaves history mode. Registered API-key values are redacted before a prompt is written. Set `KIRO_HISTORY_DIR` to store the files elsewhere.
 
-Reasoning models stream their thinking traces live as a dim `thinking…` block. Once the visible answer starts, the trace collapses to a single `reasoning (done, not saved)` line: traces are display-only and are never written to sessions or `/export`.
+Reasoning models stream their thinking traces live as a dim `thinking…` block. Once the visible answer starts, the trace collapses to a single `reasoning (done, not saved)` line: traces are display-only and are never written to sessions or `/export`. While the model is producing text the status bar switches from `thinking…` to `replying…`; tool execution shows `running <tool>…`.
+
+Each finished assistant round shows how long it took and, when the endpoint reports usage, its output throughput: `· 8.4s · 23 tok/s`. The countdown in the status bar and the per-reply timing are wall-clock (including network time), are display-only, and are not stored in saved sessions; resumed replies and replies from servers without usage simply omit them.
 
 Assistant replies are rendered as Markdown: headings, bold/italic, inline code, bullet and numbered lists, task checkboxes, blockquotes, links, and fenced code blocks. Unknown or incomplete markers fall back to their literal text, so streaming never breaks the layout.
 
@@ -415,6 +417,7 @@ If an `AGENTS.md` file exists in the working directory, its contents are appende
 - Ctrl+C aborts the HTTP stream and any running command; partial assistant text is preserved.
 - `kiro -p` runs the same agent loop without Ink, streams assistant text to stdout and diagnostics to stderr, denies tool calls unless `--yolo` is given, and saves the session like the TUI.
 - Sessions are saved atomically after each user message and completed turn, and are restored by rebuilding the visible transcript from the stored messages.
+- Reply timing is measured per model round (request start to finished reply) and includes network latency. Token throughput uses the endpoint's completion-token usage; both are shown only in the live TUI and are not persisted.
 - Model discovery calls `GET {baseUrl}/models` with a 10-second timeout; the connection test sends one tiny non-tool chat completion with the same timeout. Both can be cancelled.
 - Config saves are atomic and merge into the file on disk, so fields Kiro does not know about are preserved. Invalid JSON can be backed up and replaced with a fresh template.
 - Keys are never written to `config.json`, sessions, or logs. They live in `~/.kiro/.env` (mode `0600`) or the real environment, and the config stores only `apiKeyEnv`; actual values are never printed, are stripped from `run_command`'s environment, and are redacted from tool output before it reaches the model.

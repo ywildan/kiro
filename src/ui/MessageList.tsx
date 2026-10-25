@@ -183,6 +183,15 @@ function itemLines(item: ViewItem, width: number, expandedToolId: number | null)
         text: '',
         segments: line.segments,
       }));
+      if (!item.draft && item.durationMs !== undefined) {
+        const speed =
+          item.tokensPerSecond !== undefined ? ` · ${item.tokensPerSecond} tok/s` : '';
+        lines.push({
+          prefix: '  ',
+          text: `· ${formatDuration(item.durationMs)}${speed}`,
+          dim: true,
+        });
+      }
       lines.push(blankLine());
       return lines;
     }

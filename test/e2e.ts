@@ -1897,6 +1897,21 @@ async function main(): Promise<void> {
     const narrowContext = line({ width: 44, contextTokens: 42_300, contextWindow: 128_000 });
     assert.ok(displayWidth(narrowContext) <= 44);
 
+    const replying = line({ activity: 'replying', busySince: Date.now() - 6_400 });
+    assert.match(replying, /replying… · 6s/);
+    assert.ok(displayWidth(replying) <= 80);
+
+    const running = line({
+      activity: 'running',
+      toolName: 'grep',
+      busySince: Date.now() - 12_400,
+    });
+    assert.match(running, /running grep… · 12s/);
+
+    const justStarted = line({ activity: 'thinking', busySince: Date.now() - 200 });
+    assert.match(justStarted, /thinking…/);
+    assert.doesNotMatch(justStarted, /· \d+s/, 'no counter during the first second');
+
     const narrow = line({ width: 44, yolo: true });
     assert.match(narrow, /YOLO/);
     assert.ok(displayWidth(narrow) <= 44);
@@ -3116,6 +3131,44 @@ async function main(): Promise<void> {
       await mock.close();
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  await test('assistant replies show elapsed time and throughput once finalized', async () => {
+    const render = (item: ViewItem): string =>
+      buildLines([item], 80)
+        .map(
+          (line) =>
+            `${line.prefix}${
+              line.segments ? line.segments.map((segment) => segment.text).join('') : line.text
+            }`,
+        )
+        .join('\n');
+
+    const timed = render({
+      kind: 'assistant',
+      id: 1,
+      text: 'Done.',
+      durationMs: 8_420,
+      tokensPerSecond: 23,
+    });
+    assert.match(timed, /Done\./);
+    assert.match(timed, /· 8\.4s · 23 tok\/s/);
+
+    const short = render({ kind: 'assistant', id: 2, text: 'Quick.', durationMs: 420 });
+    assert.match(short, /· 420ms/);
+    assert.doesNotMatch(short, /tok\/s/);
+
+    const draft = render({
+      kind: 'assistant',
+      id: 3,
+      text: 'Still streaming',
+      draft: true,
+      durationMs: 5_000,
+    });
+    assert.doesNotMatch(draft, /5\.0s|tok\/s/, 'timing waits until the reply is final');
+
+    const resumed = render({ kind: 'assistant', id: 4, text: 'From a saved session' });
+    assert.doesNotMatch(resumed, /tok\/s|· \d/);
   });
 
   await test('the model wizard redraws one screen instead of piling up history', async () => {

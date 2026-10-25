@@ -21,6 +21,10 @@ export interface AssistantItem {
   id: number;
   text: string;
   draft?: boolean;
+  /** Time from the model request to this finished reply. Not stored in sessions. */
+  durationMs?: number;
+  /** Completion tokens per second, when the endpoint reported usage. */
+  tokensPerSecond?: number;
 }
 
 /** Live model reasoning (thinking traces). Shown in the transcript, not stored in the session. */

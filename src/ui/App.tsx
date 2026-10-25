@@ -154,6 +154,8 @@ export function App({
   const [runtimeConfig, setRuntimeConfig] = useState(config);
   const [profileName, setProfileName] = useState(config.activeProfile);
   const [busy, setBusy] = useState(false);
+  const [replying, setReplying] = useState(false);
+  const [busySince, setBusySince] = useState<number | null>(null);
   const [wizardPrompt, setWizardPrompt] = useState<WizardPromptState | null>(null);
   const [wizardActive, setWizardActive] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
@@ -168,6 +170,8 @@ export function App({
     (initialSession?.messages ?? []).filter((message) => message.role !== 'system'),
   );
   const usageRef = useRef<{ tokens: number; messageCount: number } | null>(null);
+  const roundStartedAtRef = useRef(0);
+  const roundCompletionTokensRef = useRef<number | null>(null);
   const [contextTokens, setContextTokens] = useState(() => estimateMessagesTokens(messagesRef.current));
   const contextTokensRef = useRef(contextTokens);
   const sessionRef = useRef<SessionState | null>(
@@ -510,15 +514,24 @@ export function App({
     [flushText],
   );
 
-  const finalizeAssistant = useCallback((content: string): void => {
-    setItems((current) => {
-      const last = current[current.length - 1];
-      if (last?.kind === 'assistant' && last.draft) {
-        return [...current.slice(0, -1), { ...last, text: content, draft: false }];
-      }
-      return [...current, { kind: 'assistant', id: nextItemIdRef.current++, text: content }];
-    });
-  }, []);
+  const finalizeAssistant = useCallback(
+    (content: string, durationMs?: number, tokensPerSecond?: number): void => {
+      setItems((current) => {
+        const last = current[current.length - 1];
+        if (last?.kind === 'assistant' && last.draft) {
+          return [
+            ...current.slice(0, -1),
+            { ...last, text: content, draft: false, durationMs, tokensPerSecond },
+          ];
+        }
+        return [
+          ...current,
+          { kind: 'assistant', id: nextItemIdRef.current++, text: content, durationMs, tokensPerSecond },
+        ];
+      });
+    },
+    [],
+  );
 
   /** Marks live "thinking…" items finished; reasoning is display-only and not saved. */
   const finalizeReasoning = useCallback((): void => {
@@ -575,6 +588,11 @@ export function App({
       busyRef.current = true;
       cancelRequestedRef.current = false;
       setBusy(true);
+      setReplying(false);
+      const startedAt = Date.now();
+      setBusySince(startedAt);
+      roundStartedAtRef.current = startedAt;
+      roundCompletionTokensRef.current = null;
       setCancelling(false);
       setActiveTool(null);
       if (!alreadyDisplayed) {
@@ -616,6 +634,7 @@ export function App({
             case 'text':
               flushText();
               finalizeReasoning();
+              setReplying(true);
               queueText(event.text);
               break;
             case 'reasoning': {
@@ -638,15 +657,25 @@ export function App({
               });
               break;
             }
-            case 'assistant':
+            case 'assistant': {
               flushText();
               finalizeReasoning();
-              finalizeAssistant(event.content);
+              const durationMs = Math.max(0, Date.now() - roundStartedAtRef.current);
+              const completionTokens = roundCompletionTokensRef.current;
+              const tokensPerSecond =
+                completionTokens !== null && completionTokens > 0 && durationMs > 0
+                  ? Math.round(completionTokens / (durationMs / 1_000))
+                  : undefined;
+              finalizeAssistant(event.content, durationMs, tokensPerSecond);
+              roundCompletionTokensRef.current = null;
+              setReplying(false);
               recomputeContext();
               break;
+            }
             case 'tool-start':
               flushText();
               finalizeReasoning();
+              setReplying(false);
               setActiveTool(event.toolCall.function.name);
               setItems((current) => [
                 ...current,
@@ -683,6 +712,9 @@ export function App({
                 return next;
               });
               recomputeContext();
+              // The next model round starts once the tools for this one finish.
+              roundStartedAtRef.current = Date.now();
+              roundCompletionTokensRef.current = null;
               break;
             case 'usage':
               usageRef.current = {
@@ -691,6 +723,7 @@ export function App({
                 // stream ends and is already counted in totalTokens.
                 messageCount: messagesRef.current.length + 1,
               };
+              roundCompletionTokensRef.current = event.usage.completionTokens;
               recomputeContext();
               break;
             case 'notice':
@@ -717,6 +750,8 @@ export function App({
         abortRef.current = null;
         busyRef.current = false;
         setBusy(false);
+        setReplying(false);
+        setBusySince(null);
         setActiveTool(null);
         setCancelling(false);
         if (pendingApprovalRef.current) resolveApproval('deny');
@@ -1408,7 +1443,9 @@ export function App({
       : busy
         ? activeTool
           ? 'running'
-          : 'thinking'
+          : replying
+            ? 'replying'
+            : 'thinking'
         : null;
   const activeProfile = runtimeConfig.profiles[profileName];
   const contextWindow = contextWindowFor(activeProfile);
@@ -1475,6 +1512,7 @@ export function App({
         cwd={cwd}
         activity={activity}
         toolName={activeTool ?? undefined}
+        busySince={busySince ?? undefined}
         queued={queuedCount > 0 ? queuedCount : undefined}
         yolo={yolo}
         autoAllowed={autoAllowed}

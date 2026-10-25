@@ -6,7 +6,7 @@ import { displayWidth, truncateMiddle, truncateToWidth } from './text.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-export type Activity = 'thinking' | 'running' | 'cancelling' | 'approval' | null;
+export type Activity = 'thinking' | 'replying' | 'running' | 'cancelling' | 'approval' | null;
 
 interface StatusBarProps {
   width: number;
@@ -15,6 +15,8 @@ interface StatusBarProps {
   cwd: string;
   activity: Activity;
   toolName?: string;
+  /** When the current turn started; drives the live elapsed counter. */
+  busySince?: number;
   /** Number of messages typed during a turn, waiting to run. */
   queued?: number;
   yolo?: boolean;
@@ -39,6 +41,7 @@ export function StatusBar({
   cwd,
   activity,
   toolName,
+  busySince,
   queued,
   yolo = false,
   autoAllowed = [],
@@ -61,12 +64,17 @@ export function StatusBar({
         ? 'cancelling…'
         : activity === 'running'
           ? `running ${toolName ?? 'tool'}…`
-          : activity === 'thinking'
-            ? 'thinking…'
-            : 'ready';
+          : activity === 'replying'
+            ? 'replying…'
+            : activity === 'thinking'
+              ? 'thinking…'
+              : 'ready';
   const stateColor =
     activity === 'cancelling' ? 'red' : activity === null ? 'green' : 'yellow';
   const spinner = busy ? `${SPINNER[frame] ?? '⠋'} ` : '';
+  const elapsedMs = busy && busySince !== undefined ? Math.max(0, Date.now() - busySince) : 0;
+  // Whole seconds keep the re-rendering spinner from making the timer flicker.
+  const elapsedNote = elapsedMs >= 1_000 ? ` · ${Math.floor(elapsedMs / 1_000)}s` : '';
   const queueNote = queued ? `${queued} queued · ` : '';
   const badge = yolo
     ? 'YOLO'
@@ -76,7 +84,7 @@ export function StatusBar({
   const badgeWidth = badge === '' ? 0 : displayWidth(badge) + 2;
   // The bar is indented to line up with the chat text, so budgets use the inner width.
   const innerWidth = Math.max(10, width - 2);
-  const state = `${spinner}${queueNote}${stateText}`;
+  const state = `${spinner}${queueNote}${stateText}${elapsedNote}`;
   const stateBudget = Math.max(4, Math.max(10, Math.floor(innerWidth / 2)) - badgeWidth);
   const stateShown = truncateToWidth(state, stateBudget);
   const restBudget = Math.max(0, innerWidth - badgeWidth - displayWidth(stateShown) - 2 - 6);
