@@ -1,5 +1,5 @@
 {
-  "name": "@ywildan/kiro",
+  "name": "@ywldan/kiro",
   "version": "0.1.0",
   "description": "A small terminal coding agent with your own OpenAI-compatible endpoint",
   "keywords": [

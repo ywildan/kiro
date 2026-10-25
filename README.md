@@ -15,7 +15,7 @@ Phase 1 (MVP) supports OpenAI-compatible chat-completions endpoints: OpenAI itse
 From npm:
 
 ```bash
-npm install -g @ywildan/kiro
+npm install -g @ywldan/kiro
 ```
 
 Then run `kiro` from any project directory.
