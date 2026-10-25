@@ -292,7 +292,7 @@ Each finished assistant round shows how long it took and, when the endpoint repo
 
 Assistant replies are rendered as Markdown: headings, bold/italic, inline code, bullet and numbered lists, task checkboxes, blockquotes, links, and fenced code blocks. Unknown or incomplete markers fall back to their literal text, so streaming never breaks the layout.
 
-Typing `/` opens a command palette above the input. It filters as you type, `↑`/`↓` select a command, `Enter` runs it, and `Tab` completes it. `Esc` clears the input.
+Typing `/` opens a command palette. It is drawn over the bottom of the transcript instead of resizing it, so the conversation does not jump when the menu opens or closes. It filters as you type, `↑`/`↓` select a command, `Enter` runs it, and `Tab` completes it. `Esc` clears the input.
 
 On a real TTY, `kiro` switches to the terminal's alternate screen: you get a clean page instead of the TUI drawing underneath the command you just ran. When Kiro exits — `/exit`, `Ctrl+C`, or an error — the terminal restores the previous shell contents and prompt. Redirected output (pipes, CI logs) is left untouched. Pass `--no-alt-screen` to stay on the normal screen instead.
 
@@ -305,7 +305,7 @@ Slash commands:
 | Command | Action |
 | --- | --- |
 | `/help` | Show commands and keys |
-| `/model` | Open the model picker: profile first, then its stored models |
+| `/model` | Open the model picker: profile first, then searchable stored models |
 | `/model <name>` | Switch profile without restarting |
 | `/model add` | Guided setup; prompts appear in the input box and the key is masked |
 | `/model edit [name]` | Edit fields, replace the key, re-test, and save |
@@ -324,7 +324,7 @@ Slash commands:
 | `/allow clear` | Ask for approval again for every tool |
 | `/exit` | Quit |
 
-`/model` opens a two-step picker. The first step lists profiles grouped by endpoint (the active one is marked `*`); `Enter` opens that profile's models. The second step lists the ids stored in the profile's `models` field with the one in use marked `*`; `Enter` applies it, switches to that profile, and saves the choice to `config.json`. `↑`/`↓` move, `Esc` goes back one step (or closes the picker), and `Ctrl+C` closes it. Press `r` on the model step to refetch `GET /models` from that endpoint and store the result; later switches need no network. A profile with no stored list still shows its current model, and adding a profile through the wizard stores whatever discovery returned for it.
+`/model` opens a two-step picker. The first step lists profiles grouped by endpoint (the active one is marked `*`); `Enter` opens that profile's models. The second step lists the ids stored in the profile's `models` field with the one in use marked `*`; `Enter` applies it, switches to that profile, and saves the choice to `config.json`. On the model step, type to filter (case-insensitive; space-separated terms must all match), `Backspace` edits the query, `Esc` clears the query first and then goes back, and `↑`/`↓` move through the filtered list. `Ctrl+R` refetches `GET /models` from that endpoint and stores the result; later switches need no network. `Ctrl+C` closes the picker. A profile with no stored list still shows its current model, and adding a profile through the wizard stores whatever discovery returned for it.
 
 ## Sessions
 

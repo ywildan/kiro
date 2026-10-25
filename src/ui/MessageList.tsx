@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput, useStdin } from 'ink';
-import type { ViewItem } from './types.js';
+import type { PaletteState, ViewItem } from './types.js';
 import { MAX_EXPANDED_TOOL_CHARS, MAX_REASONING_CHARS } from './types.js';
 import { renderMarkdown, type MarkdownSegment } from './markdown.js';
 import { parseMouseWheel } from './mouse.js';
@@ -37,6 +37,7 @@ interface RenderLine {
   color?: string;
   dim?: boolean;
   bold?: boolean;
+  inverse?: boolean;
   suffix?: Suffix;
 }
 
@@ -248,8 +249,54 @@ interface MessageListProps {
   resetSignal: number;
   /** Id of the tool item whose full output should be shown inline. */
   expandedToolId?: number | null;
+  /** Slash-menu palette drawn over the transcript's bottom rows. */
+  palette?: PaletteState | null;
   /** False while an approval prompt or wizard owns the keyboard. */
   interactive?: boolean;
+}
+
+const PALETTE_ROWS = 6;
+
+/** Header plus the visible command rows; padded so filtering never changes its height. */
+export function buildPaletteLines(palette: PaletteState, width: number): RenderLine[] {
+  const header: RenderLine = {
+    prefix: '  ',
+    text: truncateToWidth('commands · ↑/↓ move · Tab complete · Enter run', width),
+    dim: true,
+  };
+  const rows: RenderLine[] = palette.commands.slice(0, PALETTE_ROWS).map((command, index) => {
+    const active = index === palette.activeIndex;
+    const label = command.usage ? `${command.name} ${command.usage}` : command.name;
+    return {
+      prefix: active ? '› ' : '  ',
+      prefixColor: active ? 'cyan' : undefined,
+      text: '',
+      segments: [
+        { text: label, bold: active },
+        { text: `  ${command.description}`, dim: !active },
+      ],
+      inverse: active,
+    };
+  });
+  while (rows.length < PALETTE_ROWS) rows.push({ prefix: '', text: '' });
+  return [header, ...rows];
+}
+
+/**
+ * Replaces the last rows of the visible transcript with the palette, so opening
+ * the menu never resizes the transcript or moves the conversation.
+ */
+export function applyPalette(
+  lines: RenderLine[],
+  palette: PaletteState | null,
+  width: number,
+  maxRows: number,
+): RenderLine[] {
+  if (!palette) return lines;
+  const height = Math.max(1, maxRows);
+  const overlay = buildPaletteLines(palette, width).slice(0, height);
+  const keep = Math.max(0, Math.min(lines.length, height) - overlay.length);
+  return [...lines.slice(0, keep), ...overlay];
 }
 
 export function MessageList({
@@ -258,6 +305,7 @@ export function MessageList({
   height,
   resetSignal,
   expandedToolId = null,
+  palette = null,
   interactive = true,
 }: MessageListProps): React.JSX.Element {
   const { stdin } = useStdin();
@@ -315,10 +363,11 @@ export function MessageList({
   );
 
   const visible = lines.slice(scrollTop, scrollTop + height);
+  const shown = applyPalette(visible, palette, width, height);
 
   return (
     <Box flexDirection="column" height={height} overflowY="hidden" flexShrink={0} justifyContent="flex-end">
-      {visible.map((line, index) => {
+      {shown.map((line, index) => {
         const hasSuffix = line.suffix !== undefined;
         return (
           <Text
@@ -327,6 +376,7 @@ export function MessageList({
             color={line.color}
             dimColor={line.dim}
             bold={line.bold}
+            inverse={line.inverse}
           >
             {line.prefix ? (
               <Text color={line.prefixColor} dimColor={line.prefixDim} bold={line.prefixColor === 'cyan'}>

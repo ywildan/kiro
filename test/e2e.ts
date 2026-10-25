@@ -89,8 +89,9 @@ import {
   titleFromMessages,
 } from '../src/sessions.js';
 import { ApprovalPolicy } from '../src/ui/approval-policy.js';
-import { buildLines } from '../src/ui/MessageList.js';
+import { applyPalette, buildLines, buildPaletteLines } from '../src/ui/MessageList.js';
 import {
+  filterModelIds,
   modelIds,
   pickerWindow,
   profileRows,
@@ -2099,6 +2100,19 @@ async function main(): Promise<void> {
     );
     assert.deepEqual(selectableNames(rows), ['kiosapi-deepseek', 'kiosapi-qwen', 'harbor']);
     assert.deepEqual(selectableLines(rows), [1, 2, 4], 'headers are skipped when the cursor moves');
+
+    const models = [
+      'deepseek-v4.1-flash',
+      'deepseek-r1',
+      'qwen3.8-flash-free',
+      'kimi-k2',
+    ];
+    assert.deepEqual(filterModelIds(models, 'deepseek'), ['deepseek-v4.1-flash', 'deepseek-r1']);
+    assert.deepEqual(filterModelIds(models, 'DEEPSEEK flash'), ['deepseek-v4.1-flash']);
+    assert.deepEqual(filterModelIds(models, 'deepseek  free'), []);
+    assert.deepEqual(filterModelIds(models, '  '), models, 'blank search keeps everything');
+    assert.deepEqual(filterModelIds(models, 'zzz'), []);
+    assert.deepEqual(filterModelIds(models, 'kimi k2'), ['kimi-k2'], 'terms match in any order');
     assert.ok(
       profileRows(config, 'harbor').some(
         (row) => row.kind === 'profile' && row.name === 'harbor' && row.active,
@@ -3169,6 +3183,41 @@ async function main(): Promise<void> {
 
     const resumed = render({ kind: 'assistant', id: 4, text: 'From a saved session' });
     assert.doesNotMatch(resumed, /tok\/s|· \d/);
+  });
+
+  await test('the slash palette overlays the transcript without changing its height', async () => {
+    const base = Array.from({ length: 10 }, (_, index) => ({
+      prefix: '',
+      text: `line ${index}`,
+    }));
+    const palette = {
+      commands: [
+        { name: '/help', description: 'show commands and keys' },
+        { name: '/model', usage: '<name>', description: 'switch profile' },
+      ],
+      activeIndex: 1,
+    };
+    const flatten = (line: { text: string; segments?: { text: string }[] }): string =>
+      line.segments ? line.segments.map((segment) => segment.text).join('') : line.text;
+
+    const overlayed = applyPalette(base, palette, 80, 10);
+    assert.equal(overlayed.length, 10, 'the viewport height is unchanged');
+    assert.equal(overlayed[0]?.text, 'line 0');
+    assert.equal(overlayed[2]?.text, 'line 2');
+    assert.match(overlayed[3]?.text ?? '', /commands ·/);
+    assert.match(flatten(overlayed[4]!), /\/help/);
+    const active = overlayed[5]!;
+    assert.match(flatten(active), /\/model <name>/);
+    assert.equal(active.prefix, '› ');
+    assert.equal(active.inverse, true, 'the highlighted command is inverted');
+
+    assert.deepEqual(applyPalette(base, null, 80, 10), base, 'no palette means no overlay');
+    assert.equal(applyPalette(base, palette, 80, 3).length, 3, 'tiny terminals clamp the overlay');
+    assert.equal(
+      buildPaletteLines({ commands: [], activeIndex: 0 }, 80).length,
+      7,
+      'header plus six fixed rows keep the covered area stable while filtering',
+    );
   });
 
   await test('the model wizard redraws one screen instead of piling up history', async () => {

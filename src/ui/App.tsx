@@ -60,7 +60,12 @@ import { loadPromptHistory, recordPrompt } from './prompt-history.js';
 import { StatusBar, type Activity } from './StatusBar.js';
 import { summarizeToolArgs } from './text.js';
 import { undoLastCheckpoint } from '../tools/checkpoint.js';
-import { MAX_EXPANDED_TOOL_CHARS, MAX_REASONING_CHARS, type ViewItem } from './types.js';
+import {
+  MAX_EXPANDED_TOOL_CHARS,
+  MAX_REASONING_CHARS,
+  type PaletteState,
+  type ViewItem,
+} from './types.js';
 
 export interface StartupNotice {
   level: 'info' | 'error' | 'muted';
@@ -162,7 +167,7 @@ export function App({
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [slashMenuRows, setSlashMenuRows] = useState(0);
+  const [palette, setPalette] = useState<PaletteState | null>(null);
   const [mouseOn, setMouseOn] = useState(mouseEnabled);
   const [expandedToolId, setExpandedToolId] = useState<number | null>(null);
 
@@ -227,10 +232,6 @@ export function App({
     const rounded = Math.max(0, Math.round(tokens));
     contextTokensRef.current = rounded;
     setContextTokens(rounded);
-  }, []);
-
-  const handleMenuRowsChange = useCallback((rows: number): void => {
-    setSlashMenuRows((current) => (current === rows ? current : rows));
   }, []);
 
   const recomputeContext = useCallback((): void => {
@@ -1449,10 +1450,9 @@ export function App({
         : null;
   const activeProfile = runtimeConfig.profiles[profileName];
   const contextWindow = contextWindowFor(activeProfile);
-  const menuRows = pendingApproval || pickerOpen ? 0 : slashMenuRows;
   const viewportHeight = Math.max(
     3,
-    rows - 5 - (pendingApproval ? 12 : 0) - (pickerOpen ? 13 : 0) - menuRows,
+    rows - 5 - (pendingApproval ? 12 : 0) - (pickerOpen ? 13 : 0),
   );
 
   return (
@@ -1463,6 +1463,7 @@ export function App({
         height={viewportHeight}
         resetSignal={resetSignal}
         expandedToolId={expandedToolId}
+        palette={palette}
         interactive={!pendingApproval && !pickerOpen && !wizardActive && wizardPrompt === null}
       />
       {pendingApproval ? (
@@ -1488,6 +1489,7 @@ export function App({
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
           history={wizardPrompt || wizardActive ? undefined : promptHistory}
+          onPaletteChange={setPalette}
           placeholder={
             wizardPrompt
               ? wizardPrompt.defaultValue && !wizardPrompt.mask
@@ -1500,7 +1502,6 @@ export function App({
                   : 'Ask Kiro to build or change something…'
           }
           slashMenu={!wizardActive && !wizardPrompt}
-          onMenuRowsChange={handleMenuRowsChange}
           onSubmit={handleSubmit}
           onCancel={wizardActive ? cancelWizard : undefined}
         />

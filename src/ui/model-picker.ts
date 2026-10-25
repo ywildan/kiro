@@ -38,6 +38,16 @@ export function modelIds(profile: ProfileConfig | undefined): string[] {
   return stored.includes(profile.model) ? stored : [profile.model, ...stored];
 }
 
+/** Case-insensitive multi-term search: every whitespace-separated term must match. */
+export function filterModelIds(ids: string[], query: string): string[] {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return ids;
+  return ids.filter((id) => {
+    const haystack = id.toLowerCase();
+    return terms.every((term) => haystack.includes(term));
+  });
+}
+
 /** Keeps the highlighted line inside a window of `maxRows` entries. */
 export function pickerWindow(
   index: number,

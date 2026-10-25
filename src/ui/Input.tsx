@@ -9,6 +9,7 @@ import {
   parseInputChunk,
   type TextInputState,
 } from './text.js';
+import type { PaletteState } from './types.js';
 
 const MAX_INPUT_CHARS = 20_000;
 const MAX_MENU_ROWS = 6;
@@ -24,7 +25,8 @@ interface InputProps {
   history?: string[];
   onSubmit(value: string): void;
   onCancel?(): void;
-  onMenuRowsChange?(rows: number): void;
+  /** Reports the filtered slash menu so MessageList can overlay it on the transcript. */
+  onPaletteChange?(palette: PaletteState | null): void;
 }
 
 export function Input({
@@ -37,7 +39,7 @@ export function Input({
   history,
   onSubmit,
   onCancel,
-  onMenuRowsChange,
+  onPaletteChange,
 }: InputProps): React.JSX.Element {
   const { stdin } = useStdin();
   const [state, setState] = useState<TextInputState>({ chars: [], cursor: 0 });
@@ -69,17 +71,16 @@ export function Input({
   }, [text]);
 
   useEffect(() => {
-    // A fixed height keeps the layout still while the filter narrows; a shrinking
-    // menu would push the input up and down on every keystroke.
-    onMenuRowsChange?.(menuOpen ? MAX_MENU_ROWS : 0);
-  }, [menuOpen, onMenuRowsChange]);
+    onPaletteChange?.(
+      menuOpen
+        ? { commands: visibleCommands, activeIndex: Math.max(0, activeIndex - menuStart) }
+        : null,
+    );
+    // visibleCommands is derived from text, activeIndex and menuStart.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuOpen, text, activeIndex, menuStart, onPaletteChange]);
 
-  useEffect(
-    () => () => {
-      onMenuRowsChange?.(0);
-    },
-    [onMenuRowsChange],
-  );
+  useEffect(() => () => onPaletteChange?.(null), [onPaletteChange]);
 
   const update = (chars: string[], cursor: number): void => {
     const next = { chars, cursor: Math.max(0, Math.min(cursor, chars.length)) };
@@ -290,51 +291,26 @@ export function Input({
   const showPlaceholder = chars.length === 0;
 
   return (
-    <Box flexDirection="column">
-      {menuOpen ? (
-        <Box flexDirection="column" paddingLeft={2}>
-          {visibleCommands.map((command, offset) => {
-            const active = menuStart + offset === activeIndex;
-            return (
-              <Text
-                key={command.name}
-                inverse={active}
-                bold={active}
-                wrap="truncate-end"
-              >
-                {active ? '› ' : '  '}
-                {command.name}
-                {command.usage ? <Text dimColor={!active}>{` ${command.usage}`}</Text> : null}
-                <Text dimColor={!active}>{`  ${command.description}`}</Text>
-              </Text>
-            );
-          })}
-          {Array.from({ length: MAX_MENU_ROWS - visibleCommands.length }, (_, index) => (
-            <Text key={`empty-${index}`}> </Text>
-          ))}
-        </Box>
-      ) : null}
-      <Box flexShrink={0}>
-        <Text color={disabled ? 'gray' : 'cyan'} bold>
-          {'› '}
+    <Box flexShrink={0}>
+      <Text color={disabled ? 'gray' : 'cyan'} bold>
+        {'› '}
+      </Text>
+      {disabled ? (
+        <Text dimColor wrap="truncate-end">
+          {placeholder}
         </Text>
-        {disabled ? (
-          <Text dimColor wrap="truncate-end">
-            {placeholder}
-          </Text>
-        ) : showPlaceholder ? (
-          <Text wrap="truncate-end">
-            <Text inverse> </Text>
-            <Text dimColor> {placeholder}</Text>
-          </Text>
-        ) : (
-          <Text wrap="truncate-end">
-            {before}
-            <Text inverse>{at}</Text>
-            {after}
-          </Text>
-        )}
-      </Box>
+      ) : showPlaceholder ? (
+        <Text wrap="truncate-end">
+          <Text inverse> </Text>
+          <Text dimColor> {placeholder}</Text>
+        </Text>
+      ) : (
+        <Text wrap="truncate-end">
+          {before}
+          <Text inverse>{at}</Text>
+          {after}
+        </Text>
+      )}
     </Box>
   );
 }

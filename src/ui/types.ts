@@ -65,3 +65,10 @@ export type ViewItem =
   | ReasoningItem
   | ToolItem
   | NoticeItem;
+
+/** Slash-command palette data; MessageList draws it over the transcript's last rows. */
+export interface PaletteState {
+  commands: { name: string; usage?: string; description: string }[];
+  /** Index into `commands`, relative to the visible window. */
+  activeIndex: number;
+}

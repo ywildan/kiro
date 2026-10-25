@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
 import type { KiroConfig } from '../config.js';
 import {
+  filterModelIds,
   modelIds,
   pickerWindow,
   profileRows,
@@ -55,12 +56,14 @@ export function ModelPicker({
   const [index, setIndex] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
 
   const rows = profileRows(config, activeProfile);
   const names = selectableNames(rows);
   const lines = selectableLines(rows);
   const profile = step.kind === 'model' ? config.profiles[step.profile] : undefined;
-  const models = modelIds(profile);
+  const allModels = modelIds(profile);
+  const models = step.kind === 'model' ? filterModelIds(allModels, query) : allModels;
   const count = step.kind === 'profile' ? names.length : models.length;
   const selected = Math.min(index, Math.max(0, count - 1));
   const selectedLine = step.kind === 'profile' ? (lines[selected] ?? 0) : selected;
@@ -78,10 +81,21 @@ export function ModelPicker({
 
   useInput((input, key) => {
     if (refreshing) return;
+    if (step.kind === 'model' && key.ctrl && input === 'r') {
+      void refresh(step.profile);
+      return;
+    }
     if (key.escape) {
+      if (step.kind === 'model' && query) {
+        setQuery('');
+        setIndex(0);
+        setError(null);
+        return;
+      }
       if (step.kind === 'model') {
         setStep({ kind: 'profile' });
         setIndex(0);
+        setQuery('');
         setError(null);
       } else {
         onCancel();
@@ -94,8 +108,20 @@ export function ModelPicker({
       setIndex(Math.min(count - 1, Math.max(0, selected + delta)));
       return;
     }
-    if (step.kind === 'model' && input === 'r') {
-      void refresh(step.profile);
+    if (step.kind === 'model' && !key.return) {
+      if (key.backspace || key.delete) {
+        if (query) {
+          setQuery(query.slice(0, -1));
+          setIndex(0);
+        }
+        return;
+      }
+      if (key.ctrl || key.meta || key.tab || key.pageUp || key.pageDown) return;
+      const typed = input.replace(/[\u0000-\u001f\u007f]/g, '');
+      if (typed) {
+        setQuery(query + typed);
+        setIndex(0);
+      }
       return;
     }
     if (!key.return) return;
@@ -104,6 +130,7 @@ export function ModelPicker({
       if (!name) return;
       setStep({ kind: 'model', profile: name });
       setIndex(0);
+      setQuery('');
       setError(null);
       return;
     }
@@ -114,7 +141,9 @@ export function ModelPicker({
   const title =
     step.kind === 'profile'
       ? `Model · ${names.length} profile${names.length === 1 ? '' : 's'}`
-      : `Models · ${step.profile} (${models.length})`;
+      : query.trim()
+        ? `Models · ${step.profile} (${models.length}/${allModels.length} match)`
+        : `Models · ${step.profile} (${models.length})`;
 
   return (
     <Box
@@ -128,6 +157,12 @@ export function ModelPicker({
       <Text bold color="cyan" wrap="truncate-end">
         {title}
       </Text>
+      {step.kind === 'model' ? (
+        <Text wrap="truncate-end">
+          <Said>Search: </Said>
+          {query || <Said>type to filter</Said>}
+        </Text>
+      ) : null}
       {step.kind === 'profile'
         ? rows.slice(start, end).map((row, offset) => {
             const line = start + offset;
@@ -164,10 +199,15 @@ export function ModelPicker({
               </Text>
             );
           })}
+      {step.kind === 'model' && models.length === 0 ? (
+        <Text dimColor wrap="truncate-end">
+          No models match &quot;{query}&quot;. Backspace to edit, Esc to clear.
+        </Text>
+      ) : null}
       {step.kind === 'model' && profile && !profile.models?.length ? (
         <Text wrap="truncate-end">
           <Said>Only the active model is stored; press </Said>
-          <Key>r</Key>
+          <Key>Ctrl+R</Key>
           <Said> to fetch this endpoint.</Said>
         </Text>
       ) : null}
@@ -191,12 +231,14 @@ export function ModelPicker({
         </Text>
       ) : (
         <Text wrap="truncate-end">
+          <Key>↑/↓</Key>
+          <Said> move · </Said>
           <Key>Enter</Key>
-          <Said> use · </Said>
-          <Key>r</Key>
-          <Said> refetch from endpoint · </Said>
+          <Said> use · type to filter · </Said>
+          <Key>Ctrl+R</Key>
+          <Said> refetch · </Said>
           <Key>Esc</Key>
-          <Said> back</Said>
+          <Said>{query ? ' clear search' : ' back'}</Said>
         </Text>
       )}
     </Box>
