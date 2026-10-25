@@ -268,7 +268,7 @@ Exit codes: `0` success, `1` model/tool/session error, `2` usage error (includin
 | Key | Action |
 | --- | --- |
 | `Enter` | Send the prompt, or run the highlighted `/` command |
-| `Ctrl+C` | Cancel the running turn; press again to exit |
+| `Ctrl+C` | Press twice to exit; while a turn runs, the first press cancels it |
 | `PgUp` / `PgDn` | Scroll the history (the wheel works too, unless you pass `--no-mouse`) |
 | `Ctrl+O` | Expand or collapse the full output of the most recent tool call |
 | `↑` / `↓` | Move through the `/` command menu; with an empty input, recall prompt history |
@@ -280,9 +280,11 @@ Exit codes: `0` success, `1` model/tool/session error, `2` usage error (includin
 | `Ctrl+W` | Delete the previous word |
 | Left / Right / Home / End | Move the cursor |
 
-The status bar shows the active profile and model, the working directory, the context meter (`ctx 42k/128k`), the number of queued messages, and the current state (`ready`, `thinking…`, `replying…`, `running <tool>…`, `approval needed`, `cancelling…`) with a spinner and the elapsed seconds for the current turn (`replying… · 12s`). A long profile name is shortened in the middle, so the model and directory stay readable. On a wide terminal the context meter moves into the Usage card described below, leaving more room for the profile and path.
+The status bar shows the active profile and model, the working directory, the context meter (`ctx 42k/128k`), the number of queued messages, and the current state (`ready`, `thinking…`, `replying…`, `running <tool>…`, `approval needed`, `cancelling…`, `Ctrl+C again to quit`) with a spinner and the elapsed seconds for the current turn (`replying… · 12s`). A long profile name is shortened in the middle, so the model and directory stay readable. On a wide terminal the context meter moves into the Usage card described below, leaving more room for the profile and path.
 
 The input stays enabled while the agent works: type the next prompt and press Enter to queue it, and it runs as soon as the current turn ends. Queued prompts appear in the transcript right away, the status bar shows `N queued`, and Ctrl+C clears the queue together with the running turn. Slash commands typed while busy are queued the same way.
+
+Pressing Ctrl+C while idle does not exit immediately: the status bar shows `Ctrl+C again to quit` for two seconds, and a second press within that window leaves. This makes an accidental Ctrl+C harmless. `/exit` still quits right away, and a running turn is cancelled by the first press.
 
 Prompt history is stored per working directory in `~/.kiro/history/` (mode `0600`, up to 200 entries). With an empty input, `↑` recalls the most recent prompt, `↓` walks forward again, and editing the recalled text leaves history mode. Registered API-key values are redacted before a prompt is written. Set `KIRO_HISTORY_DIR` to store the files elsewhere.
 
@@ -298,7 +300,7 @@ Typing `/` opens a command palette. It is drawn over the bottom of the transcrip
 
 `/model` opens its picker as a centered overlay: the transcript, Usage card, and input row keep their places, and the input stays visible but disabled while the picker has focus. The list uses the frame's full height and reports hidden entries (`↑ 5 more · 6-15 of 30 · ↓ 15 more`) so long model lists are never silently cut off. On terminals narrower than 60 columns or shorter than 18 rows it falls back to the inline panel, which temporarily gives up transcript rows.
 
-On a real TTY, `kiro` switches to the terminal's alternate screen: you get a clean page instead of the TUI drawing underneath the command you just ran. When Kiro exits — `/exit`, `Ctrl+C`, or an error — the terminal restores the previous shell contents and prompt. Redirected output (pipes, CI logs) is left untouched. Pass `--no-alt-screen` to stay on the normal screen instead.
+On a real TTY, `kiro` switches to the terminal's alternate screen: you get a clean page instead of the TUI drawing underneath the command you just ran. When Kiro exits — `/exit`, `Ctrl+C` twice, or an error — the terminal restores the previous shell contents and prompt. Redirected output (pipes, CI logs) is left untouched. Pass `--no-alt-screen` to stay on the normal screen instead.
 
 Mouse reporting is **on by default**, so the wheel scrolls the transcript. The cost is that the terminal hands clicks to Kiro instead of starting a text selection: to copy text, hold Shift while dragging (or your terminal's equivalent), or run `/mouse` — or start with `--no-mouse` — to get plain click-drag selection back, scrolling with `PgUp`/`PgDn` instead. `/mouse` toggles it at any time.
 

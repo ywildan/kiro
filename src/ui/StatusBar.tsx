@@ -21,6 +21,8 @@ interface StatusBarProps {
   queued?: number;
   yolo?: boolean;
   autoAllowed?: string[];
+  /** Replaces the idle state with a quit confirmation hint. */
+  quitHint?: boolean;
   contextTokens?: number;
   contextWindow?: number;
 }
@@ -45,6 +47,7 @@ export function StatusBar({
   queued,
   yolo = false,
   autoAllowed = [],
+  quitHint = false,
   contextTokens,
   contextWindow,
 }: StatusBarProps): React.JSX.Element {
@@ -57,8 +60,9 @@ export function StatusBar({
     return () => clearInterval(interval);
   }, [busy]);
 
-  const stateText =
-    activity === 'approval'
+  const stateText = quitHint
+    ? 'Ctrl+C again to quit'
+    : activity === 'approval'
       ? 'approval needed'
       : activity === 'cancelling'
         ? 'cancelling…'
@@ -69,8 +73,13 @@ export function StatusBar({
             : activity === 'thinking'
               ? 'thinking…'
               : 'ready';
-  const stateColor =
-    activity === 'cancelling' ? 'red' : activity === null ? 'green' : 'yellow';
+  const stateColor = quitHint
+    ? 'red'
+    : activity === 'cancelling'
+      ? 'red'
+      : activity === null
+        ? 'green'
+        : 'yellow';
   const spinner = busy ? `${SPINNER[frame] ?? '⠋'} ` : '';
   const elapsedMs = busy && busySince !== undefined ? Math.max(0, Date.now() - busySince) : 0;
   // Whole seconds keep the re-rendering spinner from making the timer flicker.

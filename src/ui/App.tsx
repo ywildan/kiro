@@ -80,6 +80,9 @@ import {
   type ViewItem,
 } from './types.js';
 
+/** Idle Ctrl+C must be pressed again within this window to exit. */
+const QUIT_CONFIRM_MS = 2_000;
+
 export interface StartupNotice {
   level: 'info' | 'error' | 'muted';
   text: string;
@@ -180,6 +183,7 @@ export function App({
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [quitArmed, setQuitArmed] = useState(false);
   const [palette, setPalette] = useState<PaletteState | null>(null);
   const [usageCardEnabled, setUsageCardEnabled] = useState(true);
   const [mouseOn, setMouseOn] = useState(mouseEnabled);
@@ -227,6 +231,8 @@ export function App({
   const busyRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const cancelRequestedRef = useRef(false);
+  const quitArmedRef = useRef(false);
+  const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [approvalPolicy] = useState(() => new ApprovalPolicy(yolo));
   const [autoAllowed, setAutoAllowed] = useState<string[]>([]);
   const pendingApprovalRef = useRef<ApprovalRequest | null>(null);
@@ -505,6 +511,36 @@ export function App({
       exit();
     })();
   }, [exit, persistSession]);
+
+  const disarmQuit = useCallback((): void => {
+    if (quitTimerRef.current !== null) {
+      clearTimeout(quitTimerRef.current);
+      quitTimerRef.current = null;
+    }
+    quitArmedRef.current = false;
+    setQuitArmed(false);
+  }, []);
+
+  const armQuit = useCallback((): void => {
+    if (quitTimerRef.current !== null) clearTimeout(quitTimerRef.current);
+    quitArmedRef.current = true;
+    setQuitArmed(true);
+    quitTimerRef.current = setTimeout(() => {
+      quitTimerRef.current = null;
+      quitArmedRef.current = false;
+      setQuitArmed(false);
+    }, QUIT_CONFIRM_MS);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (quitTimerRef.current !== null) clearTimeout(quitTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (busy) disarmQuit();
+  }, [busy, disarmQuit]);
 
   const flushText = useCallback((): void => {
     if (flushTimerRef.current) {
@@ -1464,14 +1500,17 @@ export function App({
     }
     if (!(key.ctrl && input === 'c')) return;
     if (pickerOpen) {
+      disarmQuit();
       setPickerOpen(false);
       return;
     }
     if (wizardActiveRef.current) {
+      disarmQuit();
       cancelWizard();
       return;
     }
     if (pendingApprovalRef.current) {
+      disarmQuit();
       cancelRequestedRef.current = true;
       setCancelling(true);
       resolveApproval('deny');
@@ -1488,7 +1527,12 @@ export function App({
       abortRef.current?.abort();
       return;
     }
-    quit();
+    if (quitArmedRef.current) {
+      disarmQuit();
+      quit();
+      return;
+    }
+    armQuit();
   });
 
   const activity: Activity = pendingApproval
@@ -1592,6 +1636,7 @@ export function App({
         queued={queuedCount > 0 ? queuedCount : undefined}
         yolo={yolo}
         autoAllowed={autoAllowed}
+        quitHint={quitArmed}
         contextTokens={showUsageCard ? undefined : contextTokens}
         contextWindow={showUsageCard ? undefined : contextWindow}
       />

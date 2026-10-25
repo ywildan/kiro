@@ -1968,7 +1968,7 @@ async function main(): Promise<void> {
     assert.equal(isMouseSequence('\x1b[5~'), false);
   });
 
-  await test('status bar shows the yolo and auto-allow badges', async () => {
+  await test('status bar shows the yolo, auto-allow, and quit-confirmation states', async () => {
     const line = (props: Record<string, unknown>): string =>
       renderToString(
         React.createElement(StatusBar, {
@@ -1983,6 +1983,12 @@ async function main(): Promise<void> {
 
     assert.match(line({}), /ready/);
     assert.doesNotMatch(line({}), /YOLO|auto:/);
+
+    const quitting = line({ quitHint: true });
+    assert.match(quitting, /Ctrl\+C again to quit/);
+    assert.doesNotMatch(quitting, /ready/);
+    assert.ok(displayWidth(quitting) <= 80);
+    assert.ok(displayWidth(line({ width: 44, quitHint: true })) <= 44);
 
     const yolo = line({ yolo: true });
     assert.match(yolo, /YOLO/);
