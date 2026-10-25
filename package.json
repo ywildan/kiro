@@ -1,7 +1,26 @@
 {
-  "name": "kiro",
+  "name": "@ywildan/kiro",
   "version": "0.1.0",
   "description": "A small terminal coding agent with your own OpenAI-compatible endpoint",
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "coding-agent",
+    "openai",
+    "terminal",
+    "tui"
+  ],
+  "license": "MIT",
+  "author": "ywildan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ywildan/kiro.git"
+  },
+  "homepage": "https://github.com/ywildan/kiro#readme",
+  "bugs": {
+    "url": "https://github.com/ywildan/kiro/issues"
+  },
   "type": "module",
   "bin": {
     "kiro": "dist/index.js"
@@ -14,12 +33,15 @@
   "engines": {
     "node": ">=20"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.tsx",
     "test": "tsx test/e2e.ts",
     "mock": "tsx test/mock-server.ts",
-    "prepublishOnly": "pnpm build"
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "diff": "^9.0.0",

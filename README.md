@@ -7,10 +7,20 @@ Phase 1 (MVP) supports OpenAI-compatible chat-completions endpoints: OpenAI itse
 ## Requirements
 
 - Node.js 20 or newer
-- pnpm (npm works too, but the lockfile and scripts assume pnpm)
+- pnpm, only when building from source (npm works too, but the lockfile and scripts assume pnpm)
 - An OpenAI-compatible endpoint and, if the endpoint requires one, an API key
 
 ## Install
+
+From npm:
+
+```bash
+npm install -g @ywildan/kiro
+```
+
+Then run `kiro` from any project directory.
+
+From source:
 
 ```bash
 pnpm install
@@ -23,7 +33,7 @@ pnpm add -g .
 # pnpm link --global
 ```
 
-Then run `kiro` from any project directory. If `kiro` is not found, pnpm's global bin directory is not on your `PATH`; run `pnpm setup` once, add `~/.local/share/pnpm/bin` to `PATH`, or invoke the binary by its full path.
+If `kiro` is not found after a pnpm global install, pnpm's global bin directory is not on your `PATH`; run `pnpm setup` once, add `~/.local/share/pnpm/bin` to `PATH`, or invoke the binary by its full path.
 
 You can also run it without linking:
 
