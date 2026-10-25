@@ -53,6 +53,8 @@ import { buildResumedView } from './history.js';
 import { Input } from './Input.js';
 import { MessageList } from './MessageList.js';
 import { MOUSE_OFF, MOUSE_ON } from './mouse.js';
+import { ModelPicker, type ModelRefreshResult } from './ModelPicker.js';
+import { withProfileModel, withProfileModels } from './model-picker.js';
 import { formatProfileList } from './profile-list.js';
 import { StatusBar, type Activity } from './StatusBar.js';
 import { summarizeToolArgs } from './text.js';
@@ -155,6 +157,7 @@ export function App({
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [slashMenuRows, setSlashMenuRows] = useState(0);
   const [mouseOn, setMouseOn] = useState(mouseEnabled);
   const [expandedToolId, setExpandedToolId] = useState<number | null>(null);
@@ -276,6 +279,66 @@ export function App({
       setProfileName(effective.activeProfile);
     },
     [addNotice, overrides],
+  );
+
+  /** Saves a profile edit without resetting the session's active profile. */
+  const persistProfileChange = useCallback(
+    async (next: KiroConfig): Promise<void> => {
+      await saveConfig(next);
+      baseConfigRef.current = next;
+      let effective = next;
+      try {
+        effective = applyOverrides(next, overrides);
+      } catch {
+        // A CLI override that no longer resolves falls back to the saved config.
+      }
+      configRef.current = effective;
+      setRuntimeConfig(effective);
+    },
+    [overrides],
+  );
+
+  const selectModel = useCallback(
+    async (name: string, model: string): Promise<void> => {
+      setPickerOpen(false);
+      const switching = name !== profileName;
+      if (switching) setProfileName(name);
+      try {
+        await persistProfileChange(withProfileModel(baseConfigRef.current, name, model));
+        addNotice(
+          'info',
+          switching
+            ? `Switched to profile "${name}" (${model}).`
+            : `Model "${model}" is now active for profile "${name}".`,
+        );
+      } catch (error) {
+        addNotice('error', `Could not save the model choice: ${(error as Error).message}`);
+      }
+    },
+    [addNotice, persistProfileChange, profileName],
+  );
+
+  const refreshProfileModels = useCallback(
+    async (name: string): Promise<ModelRefreshResult> => {
+      const profile = baseConfigRef.current.profiles[name] ?? configRef.current.profiles[name];
+      if (!profile) return { ok: false, message: `Unknown profile "${name}".` };
+      const key = profile.apiKeyEnv ? process.env[profile.apiKeyEnv] : undefined;
+      if (profile.apiKeyEnv && !key) {
+        return { ok: false, message: `API key is missing: $${profile.apiKeyEnv} is not set.` };
+      }
+      const result = await discoverModels({ baseUrl: profile.baseUrl, apiKey: key });
+      if (!result.ok) return { ok: false, message: result.message };
+      if (result.models.length === 0) {
+        return { ok: false, message: 'The endpoint returned an empty model list.' };
+      }
+      try {
+        await persistProfileChange(withProfileModels(baseConfigRef.current, name, result.models));
+      } catch (error) {
+        return { ok: false, message: `Could not save the model list: ${(error as Error).message}` };
+      }
+      return { ok: true };
+    },
+    [persistProfileChange],
   );
 
   const finishWizardPrompt = useCallback((value: string | null): void => {
@@ -762,7 +825,7 @@ export function App({
           };
 
           if (!argument) {
-            listProfiles();
+            setPickerOpen(true);
             return;
           }
           if (argument === 'list') {
@@ -1178,10 +1241,15 @@ export function App({
   useInput((input, key) => {
     if (key.ctrl && input === 'o') {
       if (wizardActiveRef.current || wizardPromptRef.current || pendingApprovalRef.current) return;
+      if (pickerOpen) return;
       expandLastToolOutput();
       return;
     }
     if (!(key.ctrl && input === 'c')) return;
+    if (pickerOpen) {
+      setPickerOpen(false);
+      return;
+    }
     if (wizardActiveRef.current) {
       cancelWizard();
       return;
@@ -1217,10 +1285,10 @@ export function App({
         : null;
   const activeProfile = runtimeConfig.profiles[profileName];
   const contextWindow = contextWindowFor(activeProfile);
-  const menuRows = pendingApproval ? 0 : slashMenuRows;
+  const menuRows = pendingApproval || pickerOpen ? 0 : slashMenuRows;
   const viewportHeight = Math.max(
     3,
-    rows - 5 - (pendingApproval ? 12 : 0) - menuRows,
+    rows - 5 - (pendingApproval ? 12 : 0) - (pickerOpen ? 13 : 0) - menuRows,
   );
 
   return (
@@ -1231,13 +1299,22 @@ export function App({
         height={viewportHeight}
         resetSignal={resetSignal}
         expandedToolId={expandedToolId}
-        interactive={!pendingApproval && !wizardActive && wizardPrompt === null}
+        interactive={!pendingApproval && !pickerOpen && !wizardActive && wizardPrompt === null}
       />
       {pendingApproval ? (
         <ApprovalPrompt
           request={pendingApproval}
           width={width}
           onDecision={resolveApproval}
+        />
+      ) : pickerOpen ? (
+        <ModelPicker
+          config={runtimeConfig}
+          activeProfile={profileName}
+          width={width}
+          onSelect={(name, model) => void selectModel(name, model)}
+          onRefresh={refreshProfileModels}
+          onCancel={() => setPickerOpen(false)}
         />
       ) : (
         <Input

@@ -179,6 +179,7 @@ Set `KIRO_ENV_PATH` to use a different `.env` file (useful for testing).
 | `baseUrl` | yes | API base URL including the version segment, e.g. `https://api.openai.com/v1`. Kiro appends `/chat/completions`. |
 | `apiKeyEnv` | no | Name of the environment variable holding the API key. Omit for local servers that need no auth. |
 | `model` | yes | Model name sent to the endpoint. |
+| `models` | no | Model ids the `/model` picker offers for this profile. Filled by discovery; the model in use is always included. |
 | `temperature` | no | Sampling temperature. |
 | `maxTokens` | no | Maximum response tokens. |
 | `contextWindow` | no | Approximate model context window in tokens, at least 1000. Defaults to `128000`; drives the ctx meter and automatic compaction. |
@@ -275,7 +276,7 @@ Slash commands:
 | Command | Action |
 | --- | --- |
 | `/help` | Show commands and keys |
-| `/model` | List profiles grouped by endpoint and mark the active one |
+| `/model` | Open the model picker: profile first, then its stored models |
 | `/model <name>` | Switch profile without restarting |
 | `/model add` | Guided setup; prompts appear in the input box and the key is masked |
 | `/model edit [name]` | Edit fields, replace the key, re-test, and save |
@@ -292,6 +293,8 @@ Slash commands:
 | `/allow` | List tools that skip approval for this session |
 | `/allow clear` | Ask for approval again for every tool |
 | `/exit` | Quit |
+
+`/model` opens a two-step picker. The first step lists profiles grouped by endpoint (the active one is marked `*`); `Enter` opens that profile's models. The second step lists the ids stored in the profile's `models` field with the one in use marked `*`; `Enter` applies it, switches to that profile, and saves the choice to `config.json`. `↑`/`↓` move, `Esc` goes back one step (or closes the picker), and `Ctrl+C` closes it. Press `r` on the model step to refetch `GET /models` from that endpoint and store the result; later switches need no network. A profile with no stored list still shows its current model, and adding a profile through the wizard stores whatever discovery returned for it.
 
 ## Sessions
 

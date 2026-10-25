@@ -70,10 +70,12 @@ export function StatusBar({
       ? `auto:${autoAllowed.join(',')}`
       : '';
   const badgeWidth = badge === '' ? 0 : displayWidth(badge) + 2;
+  // The bar is indented to line up with the chat text, so budgets use the inner width.
+  const innerWidth = Math.max(10, width - 2);
   const state = `${spinner}${stateText}`;
-  const stateBudget = Math.max(4, Math.max(10, Math.floor(width / 2)) - badgeWidth);
+  const stateBudget = Math.max(4, Math.max(10, Math.floor(innerWidth / 2)) - badgeWidth);
   const stateShown = truncateToWidth(state, stateBudget);
-  const restBudget = Math.max(0, width - badgeWidth - displayWidth(stateShown) - 2 - 6);
+  const restBudget = Math.max(0, innerWidth - badgeWidth - displayWidth(stateShown) - 2 - 6);
   const context =
     contextTokens !== undefined && contextWindow !== undefined
       ? ` · ctx ${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`
@@ -90,7 +92,7 @@ export function StatusBar({
           : truncateMiddle(`${profile}${tail}`, restBudget);
 
   return (
-    <Box width={width} flexShrink={0} justifyContent="space-between">
+    <Box width={width} flexShrink={0} justifyContent="space-between" paddingLeft={2}>
       <Text wrap="truncate-end">
         <Text color="cyan" bold>
           Kiro

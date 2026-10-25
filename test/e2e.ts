@@ -90,6 +90,15 @@ import {
 } from '../src/sessions.js';
 import { ApprovalPolicy } from '../src/ui/approval-policy.js';
 import { buildLines } from '../src/ui/MessageList.js';
+import {
+  modelIds,
+  pickerWindow,
+  profileRows,
+  selectableLines,
+  selectableNames,
+  withProfileModel,
+  withProfileModels,
+} from '../src/ui/model-picker.js';
 import { formatProfileList } from '../src/ui/profile-list.js';
 import {
   SLASH_COMMANDS,
@@ -1940,6 +1949,7 @@ async function main(): Promise<void> {
             baseUrl: 'https://beta.example.com/v1/',
             apiKeyEnv: 'BETA_KEY',
             model: 'model-two',
+            models: ['model-three', 'model-two', 'model-three'],
             temperature: 0.3,
             maxTokens: 2048,
             contextWindow: 64_000,
@@ -1958,6 +1968,8 @@ async function main(): Promise<void> {
       assert.equal(raw.profiles.alpha?.temperature, 0.1);
       assert.equal(raw.profiles.beta?.baseUrl, 'https://beta.example.com/v1');
       assert.equal(raw.profiles.beta?.contextWindow, 64_000);
+      assert.deepEqual(raw.profiles.beta?.models, ['model-two', 'model-three']);
+      assert.equal(raw.profiles.alpha?.models, undefined);
       assert.equal(raw.activeProfile, 'alpha');
       assert.equal(DEFAULT_CONTEXT_WINDOW, 128_000);
       assert.throws(
@@ -2039,6 +2051,104 @@ async function main(): Promise<void> {
       }),
       ['Profiles (1):', '  https://x/v1  [openai]', '  * solo  m'],
     );
+  });
+
+  await test('the model picker groups profiles and switches stored models', () => {
+    const config: KiroConfig = {
+      activeProfile: 'kiosapi-deepseek',
+      profiles: {
+        'kiosapi-deepseek': {
+          type: 'openai',
+          baseUrl: 'https://kiosapi.com/v1',
+          model: 'deepseek-v4.1-flash-free',
+        },
+        'kiosapi-qwen': {
+          type: 'openai',
+          baseUrl: 'https://kiosapi.com/v1',
+          model: 'qwen3.8-flash-free',
+        },
+        harbor: {
+          type: 'openai',
+          baseUrl: 'https://tokenharbor.ai/v1',
+          model: 'deepseek-v4.1-flash:free',
+        },
+      },
+    };
+
+    const rows = profileRows(config);
+    assert.deepEqual(
+      rows.map((row) => row.kind),
+      ['header', 'profile', 'profile', 'header', 'profile'],
+    );
+    assert.deepEqual(selectableNames(rows), ['kiosapi-deepseek', 'kiosapi-qwen', 'harbor']);
+    assert.deepEqual(selectableLines(rows), [1, 2, 4], 'headers are skipped when the cursor moves');
+    assert.ok(
+      profileRows(config, 'harbor').some(
+        (row) => row.kind === 'profile' && row.name === 'harbor' && row.active,
+      ),
+      'the session profile is marked active, not necessarily the saved one',
+    );
+
+    assert.deepEqual(pickerWindow(0, 20, 8), { start: 0, end: 8 });
+    assert.deepEqual(pickerWindow(10, 20, 8), { start: 6, end: 14 });
+    assert.deepEqual(pickerWindow(19, 20, 8), { start: 12, end: 20 });
+    assert.deepEqual(pickerWindow(1, 3, 8), { start: 0, end: 3 });
+    assert.deepEqual(pickerWindow(0, 0, 8), { start: 0, end: 0 });
+
+    assert.deepEqual(modelIds(config.profiles['kiosapi-deepseek']), ['deepseek-v4.1-flash-free']);
+    const switched = withProfileModel(config, 'kiosapi-deepseek', 'qwen3.8-flash-free');
+    assert.equal(switched.profiles['kiosapi-deepseek']?.model, 'qwen3.8-flash-free');
+    assert.deepEqual(switched.profiles['kiosapi-deepseek']?.models, [
+      'qwen3.8-flash-free',
+      'deepseek-v4.1-flash-free',
+    ]);
+    assert.equal(
+      config.profiles['kiosapi-deepseek']?.model,
+      'deepseek-v4.1-flash-free',
+      'the input config is not mutated',
+    );
+
+    const stored = withProfileModels(config, 'kiosapi-deepseek', [
+      'qwen3.8-flash-free',
+      'deepseek-v4.1-flash-free',
+      'qwen3.8-flash-free',
+    ]);
+    assert.deepEqual(stored.profiles['kiosapi-deepseek']?.models, [
+      'deepseek-v4.1-flash-free',
+      'qwen3.8-flash-free',
+    ]);
+    assert.deepEqual(modelIds(stored.profiles['kiosapi-deepseek']), [
+      'deepseek-v4.1-flash-free',
+      'qwen3.8-flash-free',
+    ]);
+    assert.deepEqual(
+      modelIds(withProfileModel(config, 'kiosapi-deepseek', 'x').profiles['kiosapi-deepseek']),
+      ['x', 'deepseek-v4.1-flash-free'],
+    );
+    assert.equal(withProfileModel(config, 'missing', 'x'), config);
+  });
+
+  await test('profile model lists reject bad entries and keep the used model first', () => {
+    const ok = validateConfig({
+      activeProfile: 'a',
+      profiles: {
+        a: { type: 'openai', baseUrl: 'https://x/v1', model: 'm2', models: ['m1', 'm2', 'm2', 'm3'] },
+      },
+    });
+    assert.deepEqual(ok.profiles.a?.models, ['m2', 'm1', 'm3']);
+    const plain = validateConfig({
+      activeProfile: 'b',
+      profiles: { b: { type: 'openai', baseUrl: 'https://x/v1', model: 'm' } },
+    });
+    assert.equal(plain.profiles.b?.models, undefined, 'older configs stay valid');
+
+    const bad = (models: unknown): unknown => ({
+      activeProfile: 'a',
+      profiles: { a: { type: 'openai', baseUrl: 'https://x/v1', model: 'm', models } },
+    });
+    assert.throws(() => validateConfig(bad('m')), /models/);
+    assert.throws(() => validateConfig(bad(['m', 7])), /models/);
+    assert.throws(() => validateConfig(bad([''])), /models/);
   });
 
   await test('.env parsing, real-environment precedence, and 0600 key writes', async () => {
@@ -2217,6 +2327,7 @@ async function main(): Promise<void> {
       const added = await runAddFlow(addCtx);
       assert.equal(added, 'wizard-model');
       assert.equal(addCtx.config.profiles['wizard-model']?.model, 'wizard-alpha');
+      assert.deepEqual(addCtx.config.profiles['wizard-model']?.models, ['wizard-alpha', 'wizard-beta']);
       assert.equal(addCtx.config.profiles['wizard-model']?.apiKeyEnv, 'KIRO_WIZARD_MODEL_API_KEY');
       assert.equal(addCtx.config.profiles['wizard-model']?.temperature, 0.2);
       assert.equal(addCtx.config.profiles['wizard-model']?.maxTokens, 4096);

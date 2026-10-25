@@ -283,7 +283,7 @@ export function MessageList({
   const visible = lines.slice(scrollTop, scrollTop + height);
 
   return (
-    <Box flexDirection="column" height={height} overflowY="hidden" flexShrink={0}>
+    <Box flexDirection="column" height={height} overflowY="hidden" flexShrink={0} justifyContent="flex-end">
       {visible.map((line, index) => {
         const hasSuffix = line.suffix !== undefined;
         return (

@@ -10,6 +10,8 @@ export interface ProfileConfig {
   baseUrl: string;
   apiKeyEnv?: string;
   model: string;
+  /** Models this profile can switch between without another discovery request. */
+  models?: string[];
   temperature?: number;
   maxTokens?: number;
   /** Approximate model context window in tokens; used for the ctx meter and compaction. */
@@ -117,6 +119,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Keeps config.json and the picker bounded when an endpoint offers hundreds of models. */
+const MAX_STORED_MODELS = 500;
+
+/** The stored model list always starts with the model that is actually used. */
+function validateModels(name: string, raw: unknown, model: string): string[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new ConfigError(`Profile "${name}": "models" must be an array of model ids.`);
+  }
+  const seen = new Set([model]);
+  const models = [model];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      throw new ConfigError(`Profile "${name}": "models" must only contain non-empty strings.`);
+    }
+    const id = entry.trim();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    models.push(id);
+    if (models.length >= MAX_STORED_MODELS) break;
+  }
+  return models;
+}
+
 function validateProfile(name: string, raw: unknown): ProfileConfig {
   if (!isRecord(raw)) {
     throw new ConfigError(`Profile "${name}" must be an object.`);
@@ -161,6 +187,7 @@ function validateProfile(name: string, raw: unknown): ProfileConfig {
     baseUrl: baseUrl.replace(/\/+$/, ''),
     apiKeyEnv: typeof raw.apiKeyEnv === 'string' ? raw.apiKeyEnv : undefined,
     model,
+    models: validateModels(name, raw.models, model),
     temperature: raw.temperature as number | undefined,
     maxTokens: raw.maxTokens as number | undefined,
     contextWindow: raw.contextWindow as number | undefined,
@@ -317,6 +344,8 @@ export async function saveConfig(config: KiroConfig, options: SaveConfigOptions 
     else delete merged.maxTokens;
     if (profile.contextWindow !== undefined) merged.contextWindow = profile.contextWindow;
     else delete merged.contextWindow;
+    if (profile.models !== undefined) merged.models = profile.models;
+    else delete merged.models;
     profiles[name] = merged;
   }
 

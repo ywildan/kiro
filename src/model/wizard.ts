@@ -531,7 +531,9 @@ export async function runAddFlow(ctx: WizardContext): Promise<string | null> {
   if (ctx.cancelled?.()) return cancel(ctx);
 
   let model: string;
+  let discoveredModels: string[] = [];
   if (discovery.ok && discovery.models.length > 0) {
+    discoveredModels = discovery.models;
     const choice = await chooseFromList(ctx, 'Available models:', discovery.models);
     if (choice === null) return cancel(ctx);
     if (choice.kind === 'item') {
@@ -606,6 +608,7 @@ export async function runAddFlow(ctx: WizardContext): Promise<string | null> {
       baseUrl,
       apiKeyEnv: preset.local ? undefined : envName,
       model,
+      models: discoveredModels.length > 0 ? discoveredModels : undefined,
       temperature,
       maxTokens,
       contextWindow,

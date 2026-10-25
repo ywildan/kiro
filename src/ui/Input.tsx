@@ -58,8 +58,10 @@ export function Input({
   }, [text]);
 
   useEffect(() => {
-    onMenuRowsChange?.(menuOpen ? Math.min(matches.length, MAX_MENU_ROWS) : 0);
-  }, [menuOpen, matches.length, onMenuRowsChange]);
+    // A fixed height keeps the layout still while the filter narrows; a shrinking
+    // menu would push the input up and down on every keystroke.
+    onMenuRowsChange?.(menuOpen ? MAX_MENU_ROWS : 0);
+  }, [menuOpen, onMenuRowsChange]);
 
   useEffect(
     () => () => {
@@ -265,6 +267,9 @@ export function Input({
               </Text>
             );
           })}
+          {Array.from({ length: MAX_MENU_ROWS - visibleCommands.length }, (_, index) => (
+            <Text key={`empty-${index}`}> </Text>
+          ))}
         </Box>
       ) : null}
       <Box flexShrink={0}>
