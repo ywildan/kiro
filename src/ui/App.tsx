@@ -3,6 +3,12 @@ import { Box, useApp, useInput, useStdout } from 'ink';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildSystemPrompt } from '../agent/prompt.js';
+import {
+  findSkill,
+  formatSkillList,
+  loadSkills,
+  MAX_SKILL_BODY_CHARS,
+} from '../agent/skills.js';
 import { runAgentTurn } from '../agent/loop.js';
 import {
   COMPACT_KEEP_USER_TURNS,
@@ -638,10 +644,11 @@ export function App({
   }, [approvalPolicy]);
 
   const sendTurn = useCallback(
-    async (rawInput: string, alreadyDisplayed = false): Promise<void> => {
+    async (rawInput: string, alreadyDisplayed = false, displayText?: string): Promise<void> => {
       if (busyRef.current || transitioningRef.current) return;
       const text = rawInput.trim();
       if (!text) return;
+      const shown = displayText ?? text;
 
       busyRef.current = true;
       cancelRequestedRef.current = false;
@@ -656,11 +663,11 @@ export function App({
       if (!alreadyDisplayed) {
         setItems((current) => [
           ...current,
-          { kind: 'user', id: nextItemIdRef.current++, text },
+          { kind: 'user', id: nextItemIdRef.current++, text: shown },
         ]);
       }
       messagesRef.current.push({ role: 'user', content: text });
-      void recordPrompt(cwd, text).then(setPromptHistory);
+      void recordPrompt(cwd, shown).then(setPromptHistory);
       recomputeContext();
       void persistSession();
 
@@ -1076,6 +1083,45 @@ export function App({
           );
           return;
         }
+        case '/skills': {
+          if (argument) {
+            addNotice('error', 'Usage: /skills');
+            return;
+          }
+          const inventory = await loadSkills(cwd);
+          addNotice(
+            inventory.skills.length === 0 && inventory.invalid.length === 0 ? 'muted' : 'info',
+            formatSkillList(inventory, cwd),
+          );
+          return;
+        }
+        case '/skill': {
+          if (!argument || rest[1]) {
+            addNotice('error', 'Usage: /skill <name>. Run /skills to list installed skills.');
+            return;
+          }
+          const inventory = await loadSkills(cwd);
+          const skill = findSkill(inventory.skills, argument);
+          if (!skill) {
+            addNotice(
+              'error',
+              inventory.skills.length === 0
+                ? 'No skills installed. Add one at .kiro/skills/<name>/SKILL.md.'
+                : `Unknown skill "${argument}". Installed: ${inventory.skills.map((entry) => entry.name).join(', ')}.`,
+            );
+            return;
+          }
+          const body =
+            skill.body.length > MAX_SKILL_BODY_CHARS
+              ? `${skill.body.slice(0, MAX_SKILL_BODY_CHARS)}\n\n[Skill truncated; the rest is in ${skill.file}]`
+              : skill.body;
+          void sendTurn(
+            `Use the "${skill.name}" skill. Its instructions follow; apply them to what I ask next.\n\n${body}`,
+            false,
+            `/skill ${skill.name}`,
+          );
+          return;
+        }
         case '/compact': {
           if (messagesRef.current.length === 0) {
             addNotice('muted', 'There is no conversation to compact yet.');
@@ -1387,6 +1433,7 @@ export function App({
       resetAutoAllowed,
       runModelFlow,
       runProfileTest,
+      sendTurn,
       updateContextTokens,
       usageCardEnabled,
       version,

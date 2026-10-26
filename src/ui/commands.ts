@@ -7,6 +7,8 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', description: 'show this help' },
   { name: '/model', usage: '[name | add | edit | remove | test | list]', description: 'list or switch models' },
+  { name: '/skills', description: 'list installed skills and where they were found' },
+  { name: '/skill', usage: '<name>', description: 'load a skill and apply it to your next request' },
   { name: '/context', description: 'show approximate context usage' },
   { name: '/usage', description: 'show or hide the usage card' },
   { name: '/compact', description: 'summarize older turns to free context' },

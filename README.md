@@ -332,6 +332,8 @@ Slash commands:
 | `/model list --remote` | List models offered by the active endpoint's `GET /models` |
 | `/context` | Show approximate context use by message role plus session token totals |
 | `/usage` | Show or hide the Usage card, giving the transcript the full width |
+| `/skills` | List installed skills, their source, and any skipped entries |
+| `/skill <name>` | Load a skill and apply its instructions to your next request |
 | `/compact` | Summarize older turns now, keeping the last four user turns verbatim |
 | `/sessions` | List saved sessions for this working directory |
 | `/resume <n\|id>` | Resume a session by list number or id (prefixes work) |
@@ -420,6 +422,30 @@ Checkpoints are best effort: if a snapshot cannot be taken, the tool still runs.
 
 If an `AGENTS.md` file exists in the working directory, its contents are appended to the system prompt for every turn, so project-specific instructions apply immediately, including after edits.
 
+## Skills
+
+A skill is a folder of instructions that Kiro loads only when it is needed. Kiro looks in four places, in this order, and the first definition of a name wins:
+
+1. `<cwd>/.kiro/skills/`
+2. `<cwd>/.claude/skills/`, so skills installed for Claude Code work unchanged
+3. `~/.kiro/skills/`
+4. `~/.claude/skills/`
+
+Each skill is a directory with a `SKILL.md`:
+
+```md
+---
+name: anti-slop
+description: Remove AI-slop patterns from prose before answering.
+---
+
+Delete "delve", "tapestry", and stacked em dashes. Prefer concrete nouns.
+```
+
+Only the name and description reach the system prompt (up to 30 skills, descriptions clipped at 300 characters). When a request matches, the model calls `read_skill` to load the body, so twenty installed skills cost a few hundred tokens instead of their full text. `read_skill` is read-only: it needs no approval and can run alongside other reads. Supporting files in the skill directory can be opened with `read_file` or run with `run_command`, which still goes through the usual approval.
+
+`/skills` lists what was found, whether it came from the project or the user, and any skipped entry with the reason (missing description, duplicate name, oversized file). `/skill anti-slop` loads a skill immediately: the transcript shows a compact `/skill anti-slop` line while the model receives the full instructions. The index is rebuilt every turn, so edits to `SKILL.md` apply on the next message. Set `KIRO_SKILLS_DIR` to replace both user roots. A skill is instructions, not code, so it cannot bypass approvals.
+
 ## How it works
 
 - The OpenAI provider posts to `{baseUrl}/chat/completions` with `stream: true`, parses SSE incrementally, and assembles tool-call deltas by index. It also accepts a plain JSON response from servers that ignore streaming, and reads `usage` when the endpoint sends it.
@@ -454,7 +480,7 @@ The suite covers streaming, multiple tool calls per response, approvals and deni
 
 Model workflow tests use a temp `$HOME` so the real `~/.kiro` is never touched. They cover atomic config saves that preserve unknown fields, profile-name and URL validation, corrupt-config backup/recovery, `.env` parsing and real-environment precedence, `0600` writes, masking, the exact preset list, discovery success/401/missing-`/models`/timeout, the connection test, and wizard add/edit/select/remove/last-profile refusal/cancel/manual-model fallback. Scripted `kiro model add`, `list`, `use`, `test`, and `remove` run through the real CLI against the in-process mock; a failed test saves nothing, keys never appear in `config.json`, and generated keys land in `.env`. The wizard screen renderer is unit-tested against a fake stream: alternate-screen enter/leave, a new menu replacing the previous one, the breadcrumb of answered prompts (menu title instead of `Choose`, the value kept by pressing Enter, confirmation of a `Y/n` default, and the reset on Escape or a return to the root menu), stale errors dropped at a step change, log trimming to the terminal height with the prompt always visible, keyboard scrolling of an over-long list (page, top, bottom, clamping, reset on new output), and replaying results after the screen is restored. `/model` groups profiles by endpoint so several models behind one base URL are listed as siblings.
 
-The newer paths have their own coverage: `max_completion_tokens` selection for reasoning models and recovery from a `max_tokens` rejection, `reasoning_content` deltas reaching the agent and collapsing in the renderer, the stream idle timeout, checkpoint edit/create undo with backup files outside the manifest, and prompt-history dedupe/capping/redaction. A spawned `kiro -p` test runs a tool with `--yolo`, checks the reply and saved session, feeds a piped prompt through `-p -`, and verifies the non-TTY hint without `-p`.
+The newer paths have their own coverage: `max_completion_tokens` selection for reasoning models and recovery from a `max_tokens` rejection, `reasoning_content` deltas reaching the agent and collapsing in the renderer, the stream idle timeout, checkpoint edit/create undo with backup files outside the manifest, and prompt-history dedupe/capping/redaction. Skills are covered from the file to the model: frontmatter with quoted and continued values, CRLF input, `.kiro` overriding `.claude`, duplicate and invalid entries, an index in the system prompt that excludes the body, and the read-only `read_skill` tool. A spawned `kiro -p` test runs a tool with `--yolo`, checks the reply and saved session, feeds a piped prompt through `-p -`, and verifies the non-TTY hint without `-p`.
 
 ## Project layout
 
@@ -468,8 +494,8 @@ src/
   sessions.ts        atomic session save/load/list
   model/             presets, discovery/test, context-window inference, shared wizard, CLI + screen renderer
   providers/         Provider interface, OpenAI-compatible implementation
-  agent/             system prompt, agent loop, token estimates, compaction
-  tools/             tool registry, fs/search/patch/shell tools, checkpoints, glob/gitignore matching
+  agent/             system prompt, skill discovery/parsing, agent loop, token estimates, compaction
+  tools/             tool registry, fs/search/patch/shell/skill tools, checkpoints, glob/gitignore matching
   ui/                Ink app, markdown, command palette, prompt history, scrolling, approvals, status bar, export
 test/
   mock-server.ts     scripted OpenAI-compatible SSE server + /models variants

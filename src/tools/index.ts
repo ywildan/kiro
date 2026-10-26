@@ -4,12 +4,13 @@ import { fsTools } from './fs.js';
 import { patchTools } from './patch.js';
 import { searchTools } from './search.js';
 import { runCommandTool } from './shell.js';
+import { skillTools } from './skill.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { toolError } from './types.js';
 
 export const MAX_TOOL_RESULT_CHARS = 60_000;
 
-export const tools: Tool[] = [...fsTools, ...searchTools, ...patchTools, runCommandTool];
+export const tools: Tool[] = [...fsTools, ...searchTools, ...patchTools, runCommandTool, ...skillTools];
 
 export const toolDefinitions: ToolDefinition[] = tools.map((tool) => tool.definition);
 

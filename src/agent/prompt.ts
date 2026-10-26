@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { platform, release } from 'node:os';
 import path from 'node:path';
+import { formatSkillIndex, loadSkills } from './skills.js';
 
 const MAX_AGENTS_MD_BYTES = 200_000;
 
@@ -12,6 +13,21 @@ function osName(): string {
       return `macOS (${release()})`;
     default:
       return `${platform()} (${release()})`;
+  }
+}
+
+async function readAgentsSection(cwd: string): Promise<string> {
+  const agentsPath = path.join(cwd, 'AGENTS.md');
+  try {
+    const content = await readFile(agentsPath, 'utf8');
+    const clipped =
+      content.length > MAX_AGENTS_MD_BYTES
+        ? content.slice(0, MAX_AGENTS_MD_BYTES) + '\n\n[AGENTS.md truncated by Kiro]'
+        : content;
+    return `# Project instructions from AGENTS.md\n\n${clipped.trimEnd()}`;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    return `[Could not read AGENTS.md: ${(error as Error).message}]`;
   }
 }
 
@@ -40,16 +56,7 @@ export async function buildSystemPrompt(cwd: string): Promise<string> {
     'You have these tools: read_file, write_file, edit_file, multi_edit, apply_patch, list_dir, glob, grep, run_command.',
   ].join('\n');
 
-  const agentsPath = path.join(cwd, 'AGENTS.md');
-  try {
-    const content = await readFile(agentsPath, 'utf8');
-    const clipped =
-      content.length > MAX_AGENTS_MD_BYTES
-        ? content.slice(0, MAX_AGENTS_MD_BYTES) + '\n\n[AGENTS.md truncated by Kiro]'
-        : content;
-    return `${base}\n\n# Project instructions from AGENTS.md\n\n${clipped.trimEnd()}\n`;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return base;
-    return `${base}\n\n[Could not read AGENTS.md: ${(error as Error).message}]\n`;
-  }
+  const [agents, inventory] = await Promise.all([readAgentsSection(cwd), loadSkills(cwd)]);
+  const sections = [base, agents, formatSkillIndex(inventory.skills)].filter(Boolean);
+  return sections.length === 1 ? base : `${sections.join('\n\n')}\n`;
 }
