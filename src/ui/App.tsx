@@ -7,7 +7,8 @@ import {
   findSkill,
   formatSkillList,
   loadSkills,
-  MAX_SKILL_BODY_CHARS,
+  shortPath,
+  skillInvocationMessage,
 } from '../agent/skills.js';
 import { runAgentTurn } from '../agent/loop.js';
 import {
@@ -237,6 +238,7 @@ export function App({
   const busyRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const cancelRequestedRef = useRef(false);
+  const projectSkillNotedRef = useRef(false);
   const quitArmedRef = useRef(false);
   const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [approvalPolicy] = useState(() => new ApprovalPolicy(yolo));
@@ -643,6 +645,28 @@ export function App({
     setAutoAllowed([]);
   }, [approvalPolicy]);
 
+  /** Mentions once per run when the model pulls instructions that came from the repo. */
+  const noteProjectSkill = useCallback(
+    async (rawArguments: string): Promise<void> => {
+      let name: unknown;
+      try {
+        name = (JSON.parse(rawArguments || '{}') as { name?: unknown }).name;
+      } catch {
+        return;
+      }
+      if (typeof name !== 'string') return;
+      const inventory = await loadSkills(cwd);
+      const skill = findSkill(inventory.skills, name);
+      if (skill?.source !== 'project') return;
+      addNotice(
+        'muted',
+        `"${skill.name}" was loaded from this repository (${shortPath(skill.dir, cwd)}), not your ` +
+          '~/.kiro settings. Its text steers the model; tool approvals still apply.',
+      );
+    },
+    [addNotice, cwd],
+  );
+
   const sendTurn = useCallback(
     async (rawInput: string, alreadyDisplayed = false, displayText?: string): Promise<void> => {
       if (busyRef.current || transitioningRef.current) return;
@@ -778,6 +802,14 @@ export function App({
                 return next;
               });
               recomputeContext();
+              if (
+                event.toolCall.function.name === 'read_skill' &&
+                event.result.status === 'ok' &&
+                !projectSkillNotedRef.current
+              ) {
+                projectSkillNotedRef.current = true;
+                void noteProjectSkill(event.toolCall.function.arguments);
+              }
               // The next model round starts once the tools for this one finish.
               roundStartedAtRef.current = Date.now();
               roundCompletionTokensRef.current = null;
@@ -845,6 +877,7 @@ export function App({
       cwd,
       finalizeAssistant,
       flushText,
+      noteProjectSkill,
       persistSession,
       profileName,
       queueText,
@@ -1096,30 +1129,30 @@ export function App({
           return;
         }
         case '/skill': {
-          if (!argument || rest[1]) {
-            addNotice('error', 'Usage: /skill <name>. Run /skills to list installed skills.');
+          if (!argument) {
+            addNotice('error', 'Usage: /skill <name> [request]. Run /skills to list installed skills.');
             return;
           }
+          const line = input.trim();
+          const request = line
+            .slice(command.length)
+            .trim()
+            .slice(argument.length)
+            .trim();
           const inventory = await loadSkills(cwd);
           const skill = findSkill(inventory.skills, argument);
           if (!skill) {
             addNotice(
               'error',
-              inventory.skills.length === 0
-                ? 'No skills installed. Add one at .kiro/skills/<name>/SKILL.md.'
-                : `Unknown skill "${argument}". Installed: ${inventory.skills.map((entry) => entry.name).join(', ')}.`,
+              inventory.disabled
+                ? 'Skills are disabled for this run (--no-skills).'
+                : inventory.skills.length === 0
+                  ? 'No skills installed. Add one at .kiro/skills/<name>/SKILL.md.'
+                  : `Unknown skill "${argument}". Installed: ${inventory.skills.map((entry) => entry.name).join(', ')}.`,
             );
             return;
           }
-          const body =
-            skill.body.length > MAX_SKILL_BODY_CHARS
-              ? `${skill.body.slice(0, MAX_SKILL_BODY_CHARS)}\n\n[Skill truncated; the rest is in ${skill.file}]`
-              : skill.body;
-          void sendTurn(
-            `Use the "${skill.name}" skill. Its instructions follow; apply them to what I ask next.\n\n${body}`,
-            false,
-            `/skill ${skill.name}`,
-          );
+          void sendTurn(skillInvocationMessage(skill, request), false, line);
           return;
         }
         case '/compact': {

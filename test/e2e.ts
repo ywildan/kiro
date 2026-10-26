@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -9,7 +9,17 @@ import { renderToString } from 'ink';
 import React from 'react';
 
 import { buildSystemPrompt } from '../src/agent/prompt.js';
-import { formatSkillList, loadSkills, parseSkillFile } from '../src/agent/skills.js';
+import {
+  formatSkillIndex,
+  formatSkillList,
+  loadSkills,
+  MAX_SKILL_SHORT_DESCRIPTION_CHARS,
+  MAX_SKILLS_INDEX_CHARS,
+  parseSkillFile,
+  setSkillsEnabled,
+  skillInvocationMessage,
+  type Skill,
+} from '../src/agent/skills.js';
 import {
   MAX_TOOL_ROUNDS,
   planToolBatches,
@@ -3852,7 +3862,7 @@ async function main(): Promise<void> {
       assert.equal(loaded.status, 'ok');
       assert.match(loaded.content, /# Skill: anti-slop/);
       assert.match(loaded.content, /Delete every "delve"\./);
-      assert.match(loaded.content, /Skill directory: .*anti-slop/);
+      assert.match(loaded.content, /\[project skill · directory: .*anti-slop\./);
 
       const unknown = await executeTool('read_skill', JSON.stringify({ name: 'nope' }), ctx);
       assert.equal(unknown.status, 'error');
@@ -3898,10 +3908,138 @@ async function main(): Promise<void> {
       assert.match(text, /Skipped 1 entry:/);
       assert.match(text, /broken: frontmatter is missing a description/);
 
-      const emptyText = formatSkillList({ skills: [], invalid: [], roots: [userRoot] }, cwd);
+      const emptyText = formatSkillList(
+        { skills: [], invalid: [], roots: [userRoot], disabled: false },
+        cwd,
+      );
       assert.match(emptyText, /No skills installed\./);
       assert.match(emptyText, /Add one at \.kiro\/skills\/<name>\/SKILL\.md/);
     } finally {
+      if (previous === undefined) delete process.env.KIRO_SKILLS_DIR;
+      else process.env.KIRO_SKILLS_DIR = previous;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(userRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test('skills are found through symlinks and one nested level', async () => {
+    const cwd = await tempDir('kiro-skills-walk-');
+    const external = await tempDir('kiro-skills-external-');
+    const userRoot = await tempDir('kiro-skills-walk-user-');
+    const previous = process.env.KIRO_SKILLS_DIR;
+    process.env.KIRO_SKILLS_DIR = userRoot;
+    try {
+      await mkdir(path.join(external, 'deep-rule'), { recursive: true });
+      await writeFile(
+        path.join(external, 'deep-rule', 'SKILL.md'),
+        '---\nname: deep-rule\ndescription: Reached through a symlink.\n---\n\nSymlink body.\n',
+      );
+      await mkdir(path.join(cwd, '.kiro', 'skills', 'group', 'nested'), { recursive: true });
+      await writeFile(
+        path.join(cwd, '.kiro', 'skills', 'group', 'nested', 'SKILL.md'),
+        '---\ndescription: Two levels deep.\n---\n\nNested body.\n',
+      );
+      await mkdir(path.join(cwd, '.kiro', 'skills', 'empty'), { recursive: true });
+      await writeFile(path.join(cwd, '.kiro', 'skills', 'SKILL.md'), '---\nname: loose\ndescription: wrong place\n---\nbody\n');
+      await symlink(path.join(external, 'deep-rule'), path.join(cwd, '.kiro', 'skills', 'linked'));
+      await symlink(path.join(cwd, '.kiro', 'skills'), path.join(cwd, '.kiro', 'skills', 'loop'));
+
+      const inventory = await loadSkills(cwd);
+      const names = inventory.skills.map((skill) => skill.name);
+      assert.ok(names.includes('deep-rule'), 'symlinked skill folder is loaded');
+      assert.ok(names.includes('nested'), 'a skill one level deeper is found');
+      assert.equal(
+        inventory.skills.find((skill) => skill.name === 'nested')?.dir,
+        path.join(cwd, '.kiro', 'skills', 'group', 'nested'),
+      );
+      const skipped = inventory.invalid.map((entry) => entry.reason).join(' | ');
+      assert.match(skipped, /no SKILL.md in this folder/, 'empty folders are reported');
+      assert.match(skipped, /must sit in its own folder/, 'a stray SKILL.md is reported');
+      assert.ok(!names.includes('loose'), 'the stray SKILL.md is not treated as a skill');
+    } finally {
+      if (previous === undefined) delete process.env.KIRO_SKILLS_DIR;
+      else process.env.KIRO_SKILLS_DIR = previous;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(external, { recursive: true, force: true });
+      await rm(userRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test('the skill index lists every name and shrinks before overflowing', () => {
+    const make = (count: number, description: string): Skill[] =>
+      Array.from({ length: count }, (_, index) => ({
+        name: `skill-${index}`,
+        description,
+        body: 'body',
+        dir: `/tmp/skill-${index}`,
+        file: `/tmp/skill-${index}/SKILL.md`,
+        source: 'project' as const,
+      }));
+
+    const few = formatSkillIndex(make(4, 'A short description.'));
+    assert.match(few, /- skill-0: A short description\./);
+
+    const many = formatSkillIndex(make(40, 'A description that is definitely longer than the short form limit.'));
+    for (let index = 0; index < 40; index++) assert.ok(many.includes(`- skill-${index}:`), `skill-${index} listed`);
+    const longest = Math.max(...many.split('\n').filter((line) => line.startsWith('- ')).map((line) => line.length));
+    assert.ok(longest <= 14 + MAX_SKILL_SHORT_DESCRIPTION_CHARS + 1, `descriptions were clipped (${longest})`);
+
+    const enormous = formatSkillIndex(make(2000, 'x'.repeat(400)));
+    const lines = enormous.split('\n').filter((line) => line.startsWith('- '));
+    assert.ok(enormous.length <= MAX_SKILLS_INDEX_CHARS + 60, `index stayed bounded (${enormous.length})`);
+    assert.ok(lines.length < 2000, 'names were truncated as the last resort');
+    assert.match(enormous, /\(\+\d+ more skills; run \/skills to list all\.\)/);
+  });
+
+  await test('the skill invocation message carries the user request', () => {
+    const skill: Skill = {
+      name: 'anti-slop',
+      description: 'Remove AI slop.',
+      body: 'Delete "delve".',
+      dir: '/tmp/anti-slop',
+      file: '/tmp/anti-slop/SKILL.md',
+      source: 'project',
+    };
+    const bare = skillInvocationMessage(skill);
+    assert.match(bare, /apply them to what I ask next/);
+    assert.match(bare, /Delete "delve"\./);
+
+    const asked = skillInvocationMessage(skill, 'rewrite this   paragraph');
+    assert.match(asked, /Use the "anti-slop" skill for this request\./);
+    assert.match(asked, /Request: rewrite this   paragraph/);
+
+    const huge = skillInvocationMessage({ ...skill, body: 'y'.repeat(60_000) });
+    assert.match(huge, /\[Skill truncated; the rest is in \/tmp\/anti-slop\/SKILL\.md\]/);
+  });
+
+  await test('--no-skills keeps Kiro from reading skill folders', async () => {
+    const cwd = await tempDir('kiro-skills-off-');
+    const userRoot = await tempDir('kiro-skills-off-user-');
+    const previous = process.env.KIRO_SKILLS_DIR;
+    process.env.KIRO_SKILLS_DIR = userRoot;
+    try {
+      await mkdir(path.join(cwd, '.kiro', 'skills', 'anti-slop'), { recursive: true });
+      await writeFile(
+        path.join(cwd, '.kiro', 'skills', 'anti-slop', 'SKILL.md'),
+        '---\nname: anti-slop\ndescription: Remove AI slop.\n---\n\nOFF_BODY_MARK.\n',
+      );
+      const on = await loadSkills(cwd);
+      assert.equal(on.skills.length, 1);
+
+      setSkillsEnabled(false);
+      const off = await loadSkills(cwd);
+      assert.equal(off.disabled, true);
+      assert.equal(off.skills.length, 0);
+      assert.match(formatSkillList(off, cwd), /Skills are disabled for this run/);
+      assert.doesNotMatch(await buildSystemPrompt(cwd), /# Skills/);
+
+      const ctx: ToolContext = { cwd, signal: new AbortController().signal, approve: async () => 'deny' };
+      const blocked = await executeTool('read_skill', JSON.stringify({ name: 'anti-slop' }), ctx);
+      assert.equal(blocked.status, 'error');
+      assert.match(blocked.content, /Skills are disabled for this run/);
+      assert.doesNotMatch(blocked.content, /OFF_BODY_MARK/);
+    } finally {
+      setSkillsEnabled(true);
       if (previous === undefined) delete process.env.KIRO_SKILLS_DIR;
       else process.env.KIRO_SKILLS_DIR = previous;
       await rm(cwd, { recursive: true, force: true });

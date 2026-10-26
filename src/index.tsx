@@ -10,6 +10,7 @@ import {
   type CliOverrides,
   type LoadedConfig,
 } from './config.js';
+import { setSkillsEnabled } from './agent/skills.js';
 import { loadEnvFile } from './env.js';
 import { runModelCli } from './model/cli.js';
 import { readLine } from './model/cli-ui.js';
@@ -31,6 +32,7 @@ interface CliOptions {
   yolo: boolean;
   mouse: boolean;
   altScreen: boolean;
+  skills: boolean;
   help: boolean;
   version: boolean;
 }
@@ -55,6 +57,8 @@ Options:
                      transcript, Shift+drag selects text for copying.
   --no-mouse         Disable mouse reporting so plain click-drag selection works.
   --no-alt-screen    Do not switch to the terminal's alternate screen
+  --no-skills        Do not load skills from .kiro/skills, .claude/skills, or
+                     ~/.kiro/skills (KIRO_NO_SKILLS=1 does the same)
   -h, --help         Show this help
   -v, --version      Show the version
 
@@ -110,6 +114,7 @@ function parseArgs(argv: string[]): CliOptions {
     yolo: false,
     mouse: true,
     altScreen: true,
+    skills: true,
     help: false,
     version: false,
   };
@@ -141,6 +146,10 @@ function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === '--no-alt-screen') {
       options.altScreen = false;
+      continue;
+    }
+    if (arg === '--no-skills') {
+      options.skills = false;
       continue;
     }
     const equals = arg.indexOf('=');
@@ -257,6 +266,7 @@ async function main(): Promise<void> {
   }
 
   await loadEnvFile();
+  setSkillsEnabled(options.skills && process.env.KIRO_NO_SKILLS !== '1');
   const { loaded, backup } = await loadConfigWithRecovery();
   const overrides: CliOverrides = {
     profile: options.profile,

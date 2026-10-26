@@ -248,6 +248,7 @@ kiro [options]
   --mouse            Mouse reporting (on by default): wheel scrolls the transcript
   --no-mouse         Disable mouse reporting so plain click-drag selection works
   --no-alt-screen    Do not switch to the terminal's alternate screen
+  --no-skills        Do not read skill folders at all (KIRO_NO_SKILLS=1 does the same)
   -h, --help         Show help
   -v, --version      Show version
 
@@ -333,7 +334,7 @@ Slash commands:
 | `/context` | Show approximate context use by message role plus session token totals |
 | `/usage` | Show or hide the Usage card, giving the transcript the full width |
 | `/skills` | List installed skills, their source, and any skipped entries |
-| `/skill <name>` | Load a skill and apply its instructions to your next request |
+| `/skill <name> [request]` | Load a skill, optionally with your request in the same line |
 | `/compact` | Summarize older turns now, keeping the last four user turns verbatim |
 | `/sessions` | List saved sessions for this working directory |
 | `/resume <n\|id>` | Resume a session by list number or id (prefixes work) |
@@ -442,9 +443,13 @@ description: Remove AI-slop patterns from prose before answering.
 Delete "delve", "tapestry", and stacked em dashes. Prefer concrete nouns.
 ```
 
-Only the name and description reach the system prompt (up to 30 skills, descriptions clipped at 300 characters). When a request matches, the model calls `read_skill` to load the body, so twenty installed skills cost a few hundred tokens instead of their full text. `read_skill` is read-only: it needs no approval and can run alongside other reads. Supporting files in the skill directory can be opened with `read_file` or run with `run_command`, which still goes through the usual approval.
+Only `name` and `description` are read from the frontmatter; `allowed-tools`, `license`, and any other key are ignored, and a skill can never skip an approval prompt. A folder is a skill when it holds `SKILL.md`, searched two levels deep, so `skills/<name>/SKILL.md` and `skills/<group>/<name>/SKILL.md` both work, and symlinked skill folders are followed (loops are detected). Supporting files inside the folder — references, templates, scripts — are read or run like any other file, so `read_file` and `run_command` rules still apply.
 
-`/skills` lists what was found, whether it came from the project or the user, and any skipped entry with the reason (missing description, duplicate name, oversized file). `/skill anti-slop` loads a skill immediately: the transcript shows a compact `/skill anti-slop` line while the model receives the full instructions. The index is rebuilt every turn, so edits to `SKILL.md` apply on the next message. Set `KIRO_SKILLS_DIR` to replace both user roots. A skill is instructions, not code, so it cannot bypass approvals.
+Only the name and description reach the system prompt. Every installed skill is listed by name: up to 30 keep a full description, more than that clip theirs to 60 characters, and an enormous collection falls back to bare names so the prompt always stays bounded. When a request matches, the model calls `read_skill` to load the body, so fifty installed skills cost a few hundred tokens instead of their full text. `read_skill` is read-only: it needs no approval and can run alongside other reads, and it says whether the skill came from the project or your user folder.
+
+`/skills` lists what was found, whether it came from the project or the user, and any folder that was skipped with the reason (no `SKILL.md`, a `SKILL.md` sitting loose in the skills root, a missing description, a duplicate name, an oversized file). `/skill anti-slop` loads a skill for your next message; `/skill anti-slop rewrite this paragraph` loads it and sends the request in the same turn. Either way the transcript keeps the compact command line you typed while the model receives the full instructions. The first time the model pulls a skill that came from the repository you are in, Kiro says so once in the transcript.
+
+The index is rebuilt every turn, so edits to `SKILL.md` apply on the next message. Set `KIRO_SKILLS_DIR` to replace both user roots, and `--no-skills` or `KIRO_NO_SKILLS=1` (which can live in `~/.kiro/.env`) to skip skill folders entirely.
 
 ## How it works
 
@@ -480,7 +485,7 @@ The suite covers streaming, multiple tool calls per response, approvals and deni
 
 Model workflow tests use a temp `$HOME` so the real `~/.kiro` is never touched. They cover atomic config saves that preserve unknown fields, profile-name and URL validation, corrupt-config backup/recovery, `.env` parsing and real-environment precedence, `0600` writes, masking, the exact preset list, discovery success/401/missing-`/models`/timeout, the connection test, and wizard add/edit/select/remove/last-profile refusal/cancel/manual-model fallback. Scripted `kiro model add`, `list`, `use`, `test`, and `remove` run through the real CLI against the in-process mock; a failed test saves nothing, keys never appear in `config.json`, and generated keys land in `.env`. The wizard screen renderer is unit-tested against a fake stream: alternate-screen enter/leave, a new menu replacing the previous one, the breadcrumb of answered prompts (menu title instead of `Choose`, the value kept by pressing Enter, confirmation of a `Y/n` default, and the reset on Escape or a return to the root menu), stale errors dropped at a step change, log trimming to the terminal height with the prompt always visible, keyboard scrolling of an over-long list (page, top, bottom, clamping, reset on new output), and replaying results after the screen is restored. `/model` groups profiles by endpoint so several models behind one base URL are listed as siblings.
 
-The newer paths have their own coverage: `max_completion_tokens` selection for reasoning models and recovery from a `max_tokens` rejection, `reasoning_content` deltas reaching the agent and collapsing in the renderer, the stream idle timeout, checkpoint edit/create undo with backup files outside the manifest, and prompt-history dedupe/capping/redaction. Skills are covered from the file to the model: frontmatter with quoted and continued values, CRLF input, `.kiro` overriding `.claude`, duplicate and invalid entries, an index in the system prompt that excludes the body, and the read-only `read_skill` tool. A spawned `kiro -p` test runs a tool with `--yolo`, checks the reply and saved session, feeds a piped prompt through `-p -`, and verifies the non-TTY hint without `-p`.
+The newer paths have their own coverage: `max_completion_tokens` selection for reasoning models and recovery from a `max_tokens` rejection, `reasoning_content` deltas reaching the agent and collapsing in the renderer, the stream idle timeout, checkpoint edit/create undo with backup files outside the manifest, and prompt-history dedupe/capping/redaction. Skills are covered from the file to the model: frontmatter with quoted and continued values, CRLF input, `.kiro` overriding `.claude`, symlinked and nested skill folders, skipped folders reported with their reason, an index that keeps every name while clipping descriptions, an invocation message that carries the user's request, `--no-skills`, and the read-only `read_skill` tool. A spawned `kiro -p` test runs a tool with `--yolo`, checks the reply and saved session, feeds a piped prompt through `-p -`, and verifies the non-TTY hint without `-p`.
 
 ## Project layout
 

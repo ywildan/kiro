@@ -1,14 +1,30 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
 export const MAX_SKILLS_IN_PROMPT = 30;
 export const MAX_SKILL_DESCRIPTION_CHARS = 300;
+export const MAX_SKILL_SHORT_DESCRIPTION_CHARS = 60;
 export const MAX_SKILL_BODY_CHARS = 50_000;
 export const MAX_SKILL_FILE_BYTES = 200_000;
 export const MAX_SKILLS_INDEX_CHARS = 8_000;
+/** Skills are found at <root>/<name>/SKILL.md and <root>/<group>/<name>/SKILL.md. */
+export const MAX_SKILL_DEPTH = 2;
 const MAX_SKILL_NAME_CHARS = 64;
+const MAX_SKILL_DIRS_PER_ROOT = 500;
 const SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SKIP_DIR_NAMES = new Set(['node_modules', '.git']);
+
+let skillsEnabled = true;
+
+/** Turned off by --no-skills or KIRO_NO_SKILLS; nothing is read from disk then. */
+export function setSkillsEnabled(enabled: boolean): void {
+  skillsEnabled = enabled;
+}
+
+export function skillsAreEnabled(): boolean {
+  return skillsEnabled;
+}
 
 export type SkillSource = 'project' | 'user';
 
@@ -33,6 +49,7 @@ export interface SkillInventory {
   skills: Skill[];
   invalid: InvalidSkill[];
   roots: string[];
+  disabled: boolean;
 }
 
 interface SkillRoot {
@@ -142,25 +159,40 @@ export function parseSkillFile(raw: string): ParseSkillResult {
   };
 }
 
-async function readSkillDir(
-  root: string,
-  source: SkillSource,
-  entry: string,
+async function isFile(target: string): Promise<boolean> {
+  try {
+    return (await stat(target)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function isDirectory(target: string): Promise<boolean> {
+  try {
+    return (await stat(target)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function readSkillAt(
+  dir: string,
+  folder: string,
 ): Promise<{ skill?: Omit<Skill, 'source'>; invalid?: { name: string; file: string; reason: string } }> {
-  const file = path.join(root, entry, 'SKILL.md');
+  const file = path.join(dir, 'SKILL.md');
   let info;
   try {
     info = await stat(file);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === 'ENOENT' || code === 'ENOTDIR') return {};
-    return { invalid: { name: entry, file, reason: (error as Error).message } };
+    return { invalid: { name: folder, file, reason: (error as Error).message } };
   }
   if (!info.isFile()) return {};
   if (info.size > MAX_SKILL_FILE_BYTES) {
     return {
       invalid: {
-        name: entry,
+        name: folder,
         file,
         reason: `SKILL.md is larger than ${MAX_SKILL_FILE_BYTES.toLocaleString()} bytes`,
       },
@@ -170,12 +202,12 @@ async function readSkillDir(
   try {
     raw = await readFile(file, 'utf8');
   } catch (error) {
-    return { invalid: { name: entry, file, reason: (error as Error).message } };
+    return { invalid: { name: folder, file, reason: (error as Error).message } };
   }
   const parsed = parseSkillFile(raw);
-  if (!parsed.ok) return { invalid: { name: entry, file, reason: parsed.reason } };
+  if (!parsed.ok) return { invalid: { name: folder, file, reason: parsed.reason } };
 
-  const name = parsed.value.name ?? entry;
+  const name = parsed.value.name ?? folder;
   if (name.length > MAX_SKILL_NAME_CHARS || !SKILL_NAME_PATTERN.test(name)) {
     return {
       invalid: {
@@ -190,66 +222,136 @@ async function readSkillDir(
       name,
       description: parsed.value.description,
       body: parsed.value.body,
-      dir: path.join(root, entry),
+      dir,
       file,
     },
   };
 }
 
+interface ScanContext {
+  skills: Skill[];
+  invalid: InvalidSkill[];
+  byName: Map<string, Skill>;
+  /** Realpaths already walked, so symlink loops cannot recurse forever. */
+  visited: Set<string>;
+  dirs: number;
+}
+
+function addSkill(ctx: ScanContext, skill: Omit<Skill, 'source'>, source: SkillSource): void {
+  const existing = ctx.byName.get(skill.name.toLowerCase());
+  if (existing) {
+    ctx.invalid.push({
+      name: skill.name,
+      file: skill.file,
+      source,
+      reason: `duplicate name; ${existing.file} already defines it`,
+    });
+    return;
+  }
+  const complete: Skill = { ...skill, source };
+  ctx.skills.push(complete);
+  ctx.byName.set(skill.name.toLowerCase(), complete);
+}
+
+/** Returns true when a skill was found at or below dir. */
+async function walk(ctx: ScanContext, dir: string, depth: number, source: SkillSource): Promise<boolean> {
+  let resolved: string;
+  try {
+    resolved = await realpath(dir);
+  } catch {
+    return false;
+  }
+  if (ctx.visited.has(resolved)) return false;
+  ctx.visited.add(resolved);
+
+  if (depth >= 1 && (await isFile(path.join(dir, 'SKILL.md')))) {
+    const result = await readSkillAt(dir, path.basename(dir));
+    if (result.invalid) ctx.invalid.push({ ...result.invalid, source });
+    else if (result.skill) addSkill(ctx, result.skill, source);
+    return true;
+  }
+  if (depth === 0 && (await isFile(path.join(dir, 'SKILL.md')))) {
+    ctx.invalid.push({
+      name: path.basename(dir),
+      file: path.join(dir, 'SKILL.md'),
+      source,
+      reason: 'SKILL.md must sit in its own folder (<skills>/<name>/SKILL.md)',
+    });
+  }
+  if (depth >= MAX_SKILL_DEPTH) return false;
+
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (depth === 0 && code !== 'ENOENT' && code !== 'ENOTDIR') {
+      ctx.invalid.push({
+        name: path.basename(dir),
+        file: dir,
+        source,
+        reason: `cannot read the directory: ${(error as Error).message}`,
+      });
+    }
+    return false;
+  }
+
+  const names = entries
+    .filter(
+      (entry) =>
+        !entry.name.startsWith('.') &&
+        !SKIP_DIR_NAMES.has(entry.name) &&
+        (entry.isDirectory() || entry.isSymbolicLink()),
+    )
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, 'en'));
+
+  let found = false;
+  for (const name of names) {
+    if (ctx.dirs++ >= MAX_SKILL_DIRS_PER_ROOT) {
+      ctx.invalid.push({
+        name: path.basename(dir),
+        file: dir,
+        source,
+        reason: `stopped after ${MAX_SKILL_DIRS_PER_ROOT} folders in this skills root`,
+      });
+      break;
+    }
+    const child = path.join(dir, name);
+    if (!(await isDirectory(child))) continue;
+    if (await walk(ctx, child, depth + 1, source)) found = true;
+  }
+  if (!found && depth >= 1) {
+    ctx.invalid.push({
+      name: path.basename(dir),
+      file: dir,
+      source,
+      reason: 'no SKILL.md in this folder (or one level deeper)',
+    });
+  }
+  return found;
+}
+
 /** Project roots win over user roots; the first definition of a name is kept. */
 export async function loadSkills(cwd: string): Promise<SkillInventory> {
   const roots = skillRoots(cwd);
-  const skills: Skill[] = [];
-  const invalid: InvalidSkill[] = [];
-  const byName = new Map<string, Skill>();
-
-  for (const { root, source } of roots) {
-    let entries;
-    try {
-      entries = await readdir(root, { withFileTypes: true });
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
-        invalid.push({
-          name: path.basename(root),
-          file: root,
-          source,
-          reason: `cannot read the directory: ${(error as Error).message}`,
-        });
-      }
-      continue;
-    }
-    const names = entries
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-      .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b, 'en'));
-
-    for (const entryName of names) {
-      const result = await readSkillDir(root, source, entryName);
-      if (result.invalid) {
-        invalid.push({ ...result.invalid, source });
-        continue;
-      }
-      const skill = result.skill;
-      if (!skill) continue;
-      const existing = byName.get(skill.name.toLowerCase());
-      if (existing) {
-        invalid.push({
-          name: skill.name,
-          file: skill.file,
-          source,
-          reason: `duplicate name; ${existing.file} already defines it`,
-        });
-        continue;
-      }
-      const complete: Skill = { ...skill, source };
-      skills.push(complete);
-      byName.set(skill.name.toLowerCase(), complete);
-    }
+  const ctx: ScanContext = {
+    skills: [],
+    invalid: [],
+    byName: new Map(),
+    visited: new Set(),
+    dirs: 0,
+  };
+  if (skillsEnabled) {
+    for (const { root, source } of roots) await walk(ctx, root, 0, source);
   }
-
-  skills.sort((a, b) => a.name.localeCompare(b.name, 'en'));
-  return { skills, invalid, roots: roots.map(({ root }) => root) };
+  ctx.skills.sort((a, b) => a.name.localeCompare(b.name, 'en'));
+  return {
+    skills: ctx.skills,
+    invalid: ctx.invalid,
+    roots: roots.map(({ root }) => root),
+    disabled: !skillsEnabled,
+  };
 }
 
 export function findSkill(skills: Skill[], name: string): Skill | undefined {
@@ -274,25 +376,47 @@ function clipDescription(description: string, max: number): string {
 /** Name and description only; the body stays on disk until read_skill loads it. */
 export function formatSkillIndex(skills: Skill[]): string {
   if (skills.length === 0) return '';
-  const lines = [
+  const header = [
     '# Skills',
     'Installed skills extend how you work. When a request matches one, call the read_skill tool with the exact name first and follow the instructions it returns. Do not guess what a skill contains.',
   ];
-  let used = lines.join('\n').length;
-  let shown = 0;
-  for (const skill of skills.slice(0, MAX_SKILLS_IN_PROMPT)) {
-    const line = `- ${skill.name}: ${clipDescription(skill.description, MAX_SKILL_DESCRIPTION_CHARS)}`;
-    if (shown > 0 && used + line.length + 1 > MAX_SKILLS_INDEX_CHARS) break;
-    lines.push(line);
+  const budget = MAX_SKILLS_INDEX_CHARS - header.join('\n').length - 1;
+  const descriptionLimit =
+    skills.length > MAX_SKILLS_IN_PROMPT
+      ? MAX_SKILL_SHORT_DESCRIPTION_CHARS
+      : MAX_SKILL_DESCRIPTION_CHARS;
+  let lines = skills.map((skill) => `- ${skill.name}: ${clipDescription(skill.description, descriptionLimit)}`);
+  if (lines.join('\n').length > budget) lines = skills.map((skill) => `- ${skill.name}`);
+
+  const kept: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    if (kept.length > 0 && used + line.length + 1 > budget) break;
     used += line.length + 1;
-    shown++;
+    kept.push(line);
   }
-  const hidden = skills.length - shown;
-  if (hidden > 0) lines.push(`(${hidden} more installed; run /skills to list all.)`);
-  return lines.join('\n');
+  const omitted = skills.length - kept.length;
+  if (omitted > 0) kept.push(`(+${omitted} more skills; run /skills to list all.)`);
+  return [...header, ...kept].join('\n');
+}
+
+/** The user message /skill produces: full instructions plus, when given, the request. */
+export function skillInvocationMessage(skill: Skill, request = ''): string {
+  const body =
+    skill.body.length > MAX_SKILL_BODY_CHARS
+      ? `${skill.body.slice(0, MAX_SKILL_BODY_CHARS)}\n\n[Skill truncated; the rest is in ${skill.file}]`
+      : skill.body;
+  const ask = request.trim();
+  if (ask) {
+    return `Use the "${skill.name}" skill for this request.\n\n${body}\n\nRequest: ${ask}`;
+  }
+  return `Use the "${skill.name}" skill. Its instructions follow; apply them to what I ask next.\n\n${body}`;
 }
 
 export function formatSkillList(inventory: SkillInventory, cwd: string): string {
+  if (inventory.disabled) {
+    return 'Skills are disabled for this run (--no-skills or KIRO_NO_SKILLS).';
+  }
   const lines: string[] = [];
   if (inventory.skills.length === 0) {
     lines.push('No skills installed.');

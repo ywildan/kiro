@@ -24,6 +24,9 @@ const readSkillTool: Tool = {
   async run(input, ctx) {
     const name = stringArg(input, 'name')!;
     const inventory = await loadSkills(ctx.cwd);
+    if (inventory.disabled) {
+      return toolError('Skills are disabled for this run (--no-skills), so nothing can be loaded.');
+    }
     if (inventory.skills.length === 0) {
       return toolError(
         'No skills are installed. Add one at .kiro/skills/<name>/SKILL.md or ~/.kiro/skills/<name>/SKILL.md.',
@@ -42,7 +45,8 @@ const readSkillTool: Tool = {
         : skill.body;
     return ok(
       `# Skill: ${skill.name}\n\n${clipped}\n\n` +
-        `[Skill directory: ${skill.dir}. Read supporting files with read_file or run bundled scripts with run_command.]`,
+        `[${skill.source} skill · directory: ${skill.dir}. ` +
+        'Read supporting files with read_file or run bundled scripts with run_command.]',
       `read_skill ${skill.name}`,
     );
   },
