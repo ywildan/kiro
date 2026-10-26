@@ -120,6 +120,8 @@ import { ModelPicker } from '../src/ui/ModelPicker.js';
 import { formatProfileList } from '../src/ui/profile-list.js';
 import {
   SLASH_COMMANDS,
+  buildSkillCommands,
+  builtinCommandNames,
   filterSlashCommands,
   slashCommandLabel,
   slashHelpLines,
@@ -4045,6 +4047,55 @@ async function main(): Promise<void> {
       await rm(cwd, { recursive: true, force: true });
       await rm(userRoot, { recursive: true, force: true });
     }
+  });
+
+  await test('skills become slash commands and built-in names win', () => {
+    const skill = (name: string, description = 'Remove AI slop from prose.'): Skill => ({
+      name,
+      description,
+      body: 'body',
+      dir: `/tmp/${name}`,
+      file: `/tmp/${name}/SKILL.md`,
+      source: 'project',
+    });
+    const commands = buildSkillCommands([
+      skill('anti-slop'),
+      skill('Model'),
+      skill('long-one', 'A description that is definitely longer than sixty characters so it must be clipped here.'),
+      skill('anti-slop', 'duplicate folder'),
+    ]);
+    assert.deepEqual(
+      commands.map((command) => command.name),
+      ['/anti-slop', '/long-one'],
+      'built-in clashes and duplicates are dropped',
+    );
+    assert.equal(commands[0]?.description, 'skill · Remove AI slop from prose.');
+    assert.ok((commands[1]?.description ?? '').length <= 'skill · '.length + 60, 'description clipped');
+    assert.ok(builtinCommandNames().includes('model'));
+
+    const menu = [...SLASH_COMMANDS, ...commands];
+    assert.deepEqual(filterSlashCommands('/an', menu).map((command) => command.name), ['/anti-slop']);
+    assert.deepEqual(filterSlashCommands('/AN', menu).map((command) => command.name), ['/anti-slop']);
+    assert.deepEqual(filterSlashCommands('/mo', menu).map((command) => command.name), ['/model', '/mouse']);
+    assert.deepEqual(filterSlashCommands('/model add', menu), [], 'arguments still close the menu');
+    assert.deepEqual(filterSlashCommands('/'), SLASH_COMMANDS, 'default menu is unchanged');
+
+    assert.doesNotMatch(slashHelpLines().join('\n'), /<skill>/);
+    const help = slashHelpLines(2).join('\n');
+    assert.match(help, /\/<skill> \[request\].*2 installed skills/);
+
+    const text = formatSkillList(
+      {
+        skills: [skill('anti-slop'), skill('model')],
+        invalid: [],
+        roots: ['/tmp'],
+        disabled: false,
+      },
+      '/tmp',
+      builtinCommandNames(),
+    );
+    assert.match(text, /\/model is a built-in, use \/skill model/);
+    assert.ok(!text.includes('/anti-slop is a built-in'));
   });
 
   console.log('');

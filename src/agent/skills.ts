@@ -413,10 +413,15 @@ export function skillInvocationMessage(skill: Skill, request = ''): string {
   return `Use the "${skill.name}" skill. Its instructions follow; apply them to what I ask next.\n\n${body}`;
 }
 
-export function formatSkillList(inventory: SkillInventory, cwd: string): string {
+export function formatSkillList(
+  inventory: SkillInventory,
+  cwd: string,
+  reserved: string[] = [],
+): string {
   if (inventory.disabled) {
     return 'Skills are disabled for this run (--no-skills or KIRO_NO_SKILLS).';
   }
+  const taken = new Set(reserved);
   const lines: string[] = [];
   if (inventory.skills.length === 0) {
     lines.push('No skills installed.');
@@ -429,9 +434,11 @@ export function formatSkillList(inventory: SkillInventory, cwd: string): string 
     lines.push(`Installed skills (${counts}):`);
     const width = Math.min(28, Math.max(...inventory.skills.map((skill) => skill.name.length)));
     for (const skill of inventory.skills) {
+      const shadowed = taken.has(skill.name.toLowerCase());
       lines.push(
         `  ${skill.name.padEnd(width)}  ${clipDescription(skill.description, 80)} ` +
-          `[${skill.source}] (${shortPath(skill.dir, cwd)})`,
+          `[${skill.source}] (${shortPath(skill.dir, cwd)})` +
+          (shadowed ? ` · /${skill.name} is a built-in, use /skill ${skill.name}` : ''),
       );
     }
   }

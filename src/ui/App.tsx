@@ -54,7 +54,13 @@ import {
 import type { ApprovalDecision, ApprovalRequest, ToolContext } from '../tools/types.js';
 import { ApprovalPrompt } from './ApprovalPrompt.js';
 import { ApprovalPolicy } from './approval-policy.js';
-import { slashHelpLines } from './commands.js';
+import {
+  builtinCommandNames,
+  buildSkillCommands,
+  SLASH_COMMANDS,
+  slashHelpLines,
+  type SlashCommand,
+} from './commands.js';
 import { defaultExportPath, renderTranscriptMarkdown } from './export.js';
 import { buildResumedView } from './history.js';
 import { Input } from './Input.js';
@@ -645,6 +651,16 @@ export function App({
     setAutoAllowed([]);
   }, [approvalPolicy]);
 
+  const [skillCommands, setSkillCommands] = useState<SlashCommand[]>([]);
+  const refreshSkillCommands = useCallback(async (): Promise<void> => {
+    const inventory = await loadSkills(cwd);
+    setSkillCommands(buildSkillCommands(inventory.skills));
+  }, [cwd]);
+
+  useEffect(() => {
+    void refreshSkillCommands();
+  }, [refreshSkillCommands]);
+
   /** Mentions once per run when the model pulls instructions that came from the repo. */
   const noteProjectSkill = useCallback(
     async (rawArguments: string): Promise<void> => {
@@ -859,6 +875,7 @@ export function App({
         if (pendingApprovalRef.current) resolveApproval('deny');
         recomputeContext();
         void persistSession();
+        void refreshSkillCommands();
         if (!quittingRef.current) {
           if (cancelRequestedRef.current && queuedRef.current.length > 0) {
             queuedRef.current = [];
@@ -879,6 +896,7 @@ export function App({
       flushText,
       noteProjectSkill,
       persistSession,
+      refreshSkillCommands,
       profileName,
       queueText,
       recomputeContext,
@@ -985,6 +1003,7 @@ export function App({
       if (busyRef.current || transitioningRef.current) return;
       const [command, ...rest] = input.trim().split(/\s+/);
       const argument = rest[0];
+      if (!command) return;
 
       switch (command) {
         case '/help': {
@@ -992,7 +1011,7 @@ export function App({
             'info',
             [
               'Commands (type / to open the menu, ↑↓ to choose, Enter to run):',
-              ...slashHelpLines(),
+              ...slashHelpLines(skillCommands.length),
               '',
               '  Model subcommands: /model <name> · /model add · /model edit [name] ·',
               '                     /model remove [name] · /model test [name] · /model list --remote',
@@ -1124,7 +1143,7 @@ export function App({
           const inventory = await loadSkills(cwd);
           addNotice(
             inventory.skills.length === 0 && inventory.invalid.length === 0 ? 'muted' : 'info',
-            formatSkillList(inventory, cwd),
+            formatSkillList(inventory, cwd, builtinCommandNames()),
           );
           return;
         }
@@ -1449,8 +1468,23 @@ export function App({
         case '/exit':
           quit();
           return;
-        default:
+        default: {
+          const skillName = command.startsWith('/') ? command.slice(1) : '';
+          if (skillName) {
+            const inventory = await loadSkills(cwd);
+            const skill = findSkill(inventory.skills, skillName);
+            if (skill) {
+              const line = input.trim();
+              void sendTurn(
+                skillInvocationMessage(skill, line.slice(command.length).trim()),
+                false,
+                line,
+              );
+              return;
+            }
+          }
           addNotice('error', `Unknown command "${command}". Type /help for commands.`);
+        }
       }
     },
     [
@@ -1686,6 +1720,7 @@ export function App({
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
           history={wizardPrompt || wizardActive ? undefined : promptHistory}
+          slashCommands={[...SLASH_COMMANDS, ...skillCommands]}
           onPaletteChange={setPalette}
           placeholder={
             pickerOpen

@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Box, Text, useInput, useStdin } from 'ink';
 import stringWidth from 'string-width';
-import { filterSlashCommands } from './commands.js';
+import { filterSlashCommands, type SlashCommand } from './commands.js';
 import { isMouseSequence } from './mouse.js';
 import {
   applyInputOps,
@@ -21,6 +21,8 @@ interface InputProps {
   mask?: boolean;
   allowEmpty?: boolean;
   slashMenu?: boolean;
+  /** Command menu contents: built-ins plus skill commands. */
+  slashCommands?: SlashCommand[];
   /** Submitted prompts, oldest first; ↑/↓ recall them when the input is empty. */
   history?: string[];
   onSubmit(value: string): void;
@@ -36,6 +38,7 @@ export function Input({
   mask = false,
   allowEmpty = false,
   slashMenu = true,
+  slashCommands,
   history,
   onSubmit,
   onCancel,
@@ -57,7 +60,7 @@ export function Input({
     }
   }, [historyIndex, recalled, text]);
   const matches =
-    slashMenu && !mask && !disabled ? filterSlashCommands(text) : [];
+    slashMenu && !mask && !disabled ? filterSlashCommands(text, slashCommands) : [];
   const menuOpen = matches.length > 0;
   const activeIndex = Math.min(selected, Math.max(0, matches.length - 1));
   const menuStart = Math.max(
