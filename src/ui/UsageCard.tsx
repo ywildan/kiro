@@ -51,8 +51,8 @@ export function UsageCard({
   const accent = busy ? 'cyan' : 'gray';
   const innerWidth = Math.max(8, width - 4);
   const title = truncateToWidth(`Usage · ${usage.requests} req`, innerWidth);
-  const prompt = usage.requests > 0 ? formatTokens(usage.promptTokens) : '—';
-  const completion = usage.requests > 0 ? formatTokens(usage.completionTokens) : '—';
+  const prompt = usage.requests > 0 ? formatTokens(usage.promptTokens) : '-';
+  const completion = usage.requests > 0 ? formatTokens(usage.completionTokens) : '-';
   const bar = contextBar(contextTokens, contextWindow, Math.max(4, innerWidth - 9));
   const contextLine = truncateToWidth(
     `ctx ${bar} ${formatPercent(contextTokens, contextWindow).padStart(4)}`,

@@ -1105,7 +1105,7 @@ export function App({
               `Context: ~${formatTokens(used)} / ${formatTokens(window)} tokens (${formatPercent(used, window)} used)` +
                 (profile?.contextWindow
                   ? '.'
-                  : ' — window inferred from the model id; set "contextWindow" in the profile to override.'),
+                  : '. Window inferred from the model id; set "contextWindow" in the profile to override.'),
               `  system ~${formatTokens(count('system'))} · user ~${formatTokens(count('user'))} · ` +
                 `assistant ~${formatTokens(count('assistant'))} · tool ~${formatTokens(count('tool'))}`,
               usage

@@ -65,7 +65,7 @@ export async function executeTool(
   } catch (error) {
     return toolError(
       `Invalid JSON arguments for ${name}: ${(error as Error).message}. ` +
-        'The arguments were truncated or malformed — often because the response hit its ' +
+        'The arguments were truncated or malformed, often because the response hit its ' +
         'max_tokens limit. Resend this call with smaller arguments (split the work into ' +
         'several calls) or ask for a higher maxTokens.',
     );

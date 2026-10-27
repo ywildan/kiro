@@ -2071,8 +2071,8 @@ async function main(): Promise<void> {
     }
 
     const empty = render({});
-    assert.match(empty, /↑ —/);
-    assert.match(empty, /↓ —/);
+    assert.match(empty, /↑ -/);
+    assert.match(empty, /↓ -/);
     assert.match(empty, /no timed reply yet/);
     assert.match(empty, /~0 \/ 64k window/);
     assert.match(empty, /0%/);
@@ -3546,8 +3546,8 @@ async function main(): Promise<void> {
       'info',
       [
         'Choose a provider',
-        '  1. OpenRouter — https://openrouter.ai/api/v1',
-        '  2. Custom endpoint — enter a base URL',
+        '  1. OpenRouter · https://openrouter.ai/api/v1',
+        '  2. Custom endpoint · enter a base URL',
         '',
         'Enter a number.',
       ].join('\n'),

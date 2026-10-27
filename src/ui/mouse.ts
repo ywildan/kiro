@@ -4,7 +4,7 @@ export const MOUSE_SCROLL_LINES = 3;
 /**
  * Enables button/wheel reporting with SGR coordinates; paired with MOUSE_OFF.
  * xterm has no wheel-only mode, so turning this on also hands clicks to Kiro
- * instead of starting a text selection — copy/paste then needs Shift+drag.
+ * instead of starting a text selection, so copy/paste needs Shift+drag.
  */
 export const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
 export const MOUSE_OFF = '\x1b[?1006l\x1b[?1000l';

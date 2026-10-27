@@ -48,25 +48,25 @@ async function latestVersion(): Promise<string> {
   return latest;
 }
 
-/** `kiro check` — compare the installed version with the registry. Exit 0 current, 1 update available, 2 check failed. */
+/** `kiro check`: compare the installed version with the registry. Exit 0 current, 1 update available, 2 check failed. */
 export async function runCheck(): Promise<number> {
   let latest: string;
   try {
     latest = await latestVersion();
   } catch (error) {
-    console.error(`Kiro ${VERSION} — version check failed: ${(error as Error).message}`);
+    console.error(`Kiro ${VERSION}: version check failed: ${(error as Error).message}`);
     console.error('Check manually with: npm view @ywldan/kiro version');
     return 2;
   }
   if (compareVersions(VERSION, latest) >= 0) {
-    process.stdout.write(`Kiro ${VERSION} — up to date\n`);
+    process.stdout.write(`Kiro ${VERSION}: up to date\n`);
     return 0;
   }
   process.stdout.write(`Kiro ${VERSION} → ${latest} available. Run "kiro update" to upgrade.\n`);
   return 1;
 }
 
-/** `kiro update` — install the latest published version globally through npm. */
+/** `kiro update`: install the latest published version globally through npm. */
 export async function runUpdate(): Promise<number> {
   let latest: string;
   try {
@@ -75,7 +75,7 @@ export async function runUpdate(): Promise<number> {
     latest = 'latest';
   }
   if (latest !== 'latest' && compareVersions(VERSION, latest) >= 0) {
-    process.stdout.write(`Kiro ${VERSION} — already up to date, nothing to do\n`);
+    process.stdout.write(`Kiro ${VERSION}: already up to date, nothing to do\n`);
     return 0;
   }
   process.stdout.write(`Updating Kiro ${VERSION} → ${latest} via npm…\n`);

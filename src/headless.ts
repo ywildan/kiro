@@ -43,7 +43,7 @@ export interface HeadlessOptions {
  * Text streams to stdout; notices, tool calls, and reasoning go to stderr, so
  * `kiro -p … > out.md` stays clean for scripting. Same session store, system
  * prompt, compaction, and tools as the TUI. Approvals are denied outside
- * --yolo mode — a piped run never performs an unsupervised mutation.
+ * --yolo mode: a piped run never performs an unsupervised mutation.
  */
 export async function runHeadless(options: HeadlessOptions): Promise<number> {
   const { config, cwd, yolo } = options;

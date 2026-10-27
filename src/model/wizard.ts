@@ -166,7 +166,7 @@ async function pickProfile(
     names.map((name) => {
       const profile = ctx.config.profiles[name]!;
       const active = name === ctx.config.activeProfile ? ' [active]' : '';
-      return { key: name, label: `${name}${active} — ${profile.model} @ ${profile.baseUrl}` };
+      return { key: name, label: `${name}${active} · ${profile.model} @ ${profile.baseUrl}` };
     }),
   );
 }
@@ -468,10 +468,10 @@ export async function runAddFlow(ctx: WizardContext): Promise<string | null> {
     presets.map((preset: ProviderPreset) => ({
       key: preset.id,
       label: preset.local
-        ? `${preset.label} — ${preset.baseUrl} (no key)`
+        ? `${preset.label} · ${preset.baseUrl} (no key)`
         : preset.apiKeyEnv
-          ? `${preset.label} — ${preset.baseUrl} ($${preset.apiKeyEnv})`
-          : `${preset.label} — enter a base URL`,
+          ? `${preset.label} · ${preset.baseUrl} ($${preset.apiKeyEnv})`
+          : `${preset.label} · enter a base URL`,
     })),
   );
   if (presetId === null) return cancel(ctx);

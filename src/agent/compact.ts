@@ -8,7 +8,7 @@ export const MAX_SUMMARY_INPUT_CHARS = 100_000;
 const MAX_TRANSCRIPT_MESSAGE_CHARS = 4_000;
 const TOOL_ARGS_PREVIEW_CHARS = 500;
 
-export const SUMMARY_PREFIX = '[Context summary — earlier turns were compacted to save space]';
+export const SUMMARY_PREFIX = '[Context summary: earlier turns were compacted to save space]';
 
 export interface CompactOptions {
   messages: ChatMessage[];

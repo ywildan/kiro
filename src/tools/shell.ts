@@ -136,7 +136,7 @@ export const runCommandTool: Tool = {
         const statusLine =
           `exit code: ${exit}` +
           (signal ? ` (signal ${signal})` : '') +
-          (flags.length ? ` — ${flags.join(', ')}` : '');
+          (flags.length ? ` (${flags.join(', ')})` : '');
         const content = truncateMiddle(`${statusLine}\n${sections.join('\n')}`, MAX_OUTPUT_CHARS);
         const summary =
           timedOut

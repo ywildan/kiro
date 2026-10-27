@@ -37,7 +37,7 @@ interface CliOptions {
   version: boolean;
 }
 
-const HELP = `Kiro — a small terminal coding agent
+const HELP = `Kiro: a small terminal coding agent
 
 Usage: kiro [options]
        kiro model [command]
