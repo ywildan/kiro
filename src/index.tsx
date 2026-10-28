@@ -20,6 +20,7 @@ import { latestSession, loadSession, type SessionRecord } from './sessions.js';
 import { MOUSE_OFF } from './ui/mouse.js';
 import { App, type StartupNotice } from './ui/App.js';
 import { runCheck, runUpdate } from './update.js';
+import { runDoctor } from './doctor.js';
 import { VERSION } from './version.js';
 
 interface CliOptions {
@@ -41,6 +42,7 @@ const HELP = `Kiro: a small terminal coding agent
 
 Usage: kiro [options]
        kiro model [command]
+       kiro doctor [options]
 
 Options:
   --profile <name>   Use a profile from ~/.kiro/config.json
@@ -73,6 +75,9 @@ Model commands:
 Update commands:
   kiro check         Compare the installed version with the latest on npm
   kiro update        Install the latest version from npm globally
+
+Diagnostics:
+  kiro doctor        Check Node, config, key storage, and the active endpoint
 
 Config: ~/.kiro/config.json (created with a template on first run)
 Keys: ~/.kiro/.env (mode 0600), or the environment variable named by "apiKeyEnv".
@@ -222,6 +227,10 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === 'update') {
     process.exitCode = await runUpdate();
+    return;
+  }
+  if (rawArgs[0] === 'doctor') {
+    process.exitCode = await runDoctor(rawArgs.slice(1));
     return;
   }
 

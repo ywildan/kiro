@@ -137,10 +137,16 @@ import {
 import { addUsage, EMPTY_USAGE, normalizeUsage } from '../src/usage.js';
 import { buildResumedView } from '../src/ui/history.js';
 import { loadPromptHistory, recordPrompt, rememberPrompt } from '../src/ui/prompt-history.js';
+import { filterFiles, listProjectFiles } from '../src/ui/file-index.js';
+import { mentionAt, mentionNearby, mentionOpeningAt, mentionText } from '../src/ui/mention.js';
 import { snapshotBeforeMutation, undoLastCheckpoint } from '../src/tools/checkpoint.js';
 import {
   applyInputOps,
+  cursorLineIndex,
   displayWidth,
+  feedPaste,
+  layoutInput,
+  normalizePastedText,
   parseEditSequence,
   parseInputChunk,
   truncateMiddle,
@@ -1762,7 +1768,7 @@ async function main(): Promise<void> {
 
     const pasted = applyInputOps({ chars: [], cursor: 0 }, parseInputChunk('one\ntwo\n'));
     assert.equal(pasted.submitted, false);
-    assert.equal(pasted.state.chars.join(''), 'one two ');
+    assert.equal(pasted.state.chars.join(''), 'one\ntwo\n');
 
     const long = `${'x'.repeat(300)}\r`;
     const longApplied = applyInputOps({ chars: [], cursor: 0 }, parseInputChunk(long));
@@ -1773,6 +1779,112 @@ async function main(): Promise<void> {
     assert.deepEqual(capped.state.chars, ['a', 'b', 'c']);
     assert.equal(capped.state.cursor, 3);
     assert.equal(capped.submitted, true);
+  });
+
+  await test('multi-line input keeps newlines and wraps around the caret', async () => {
+    const newline = applyInputOps({ chars: [], cursor: 0 }, parseInputChunk('\n'));
+    assert.deepEqual(newline.state.chars, ['\n']);
+    assert.equal(newline.submitted, false);
+
+    const typed = applyInputOps({ chars: [], cursor: 0 }, parseInputChunk('one\ntwo'));
+    assert.equal(typed.state.chars.join(''), 'one\ntwo');
+
+    const backslash = applyInputOps({ chars: [], cursor: 0 }, parseInputChunk('path\\\r'));
+    assert.equal(backslash.submitted, false, 'backslash+Enter adds a line instead of submitting');
+    assert.equal(backslash.state.chars.join(''), 'path\n');
+
+    const crlf = applyInputOps({ chars: [], cursor: 0 }, parseInputChunk('one\r\ntwo'));
+    assert.equal(crlf.state.chars.join(''), 'one\ntwo');
+
+    let paste = { open: false, buffer: '', pending: '' };
+    let fed = feedPaste(paste, '\x1b[200~hello\nworld\x1b[201~');
+    paste = fed.state;
+    assert.equal(fed.text, 'hello\nworld');
+    assert.equal(paste.open, false);
+
+    let split = { open: false, buffer: '', pending: '' };
+    fed = feedPaste(split, '[200~first\nsecond');
+    split = fed.state;
+    assert.equal(fed.text, null);
+    assert.equal(split.open, true);
+    fed = feedPaste(split, 'third\x1b[201~');
+    assert.equal(fed.text, 'first\nsecondthird');
+
+    let torn = { open: false, buffer: '', pending: '' };
+    fed = feedPaste(torn, '[20');
+    torn = fed.state;
+    assert.equal(fed.text, null, 'a torn start marker inserts nothing');
+    assert.equal(fed.consumed, true);
+    assert.equal(torn.pending, '[20');
+    fed = feedPaste(torn, '0~pasted text\x1b[201~');
+    assert.equal(fed.text, 'pasted text');
+
+    const untouched = feedPaste({ open: false, buffer: '', pending: '' }, 'plain');
+    assert.equal(untouched.consumed, false, 'normal typing still reaches the key parser');
+
+    assert.equal(normalizePastedText('a\r\nb\tc'), 'a\nb    c');
+
+    const lines = layoutInput(Array.from('abcdef'), 3);
+    assert.deepEqual(lines.map((line) => line.text), ['abc', 'def']);
+    assert.equal(cursorLineIndex(lines, 3), 1, 'caret wraps to the next row');
+
+    const explicit = layoutInput(Array.from('ab\ncd'), 10);
+    assert.deepEqual(explicit.map((line) => line.text), ['ab', 'cd']);
+    assert.equal(cursorLineIndex(explicit, 2), 0, 'caret stays before the newline');
+    assert.deepEqual(
+      layoutInput(Array.from('a\n'), 10).map((line) => line.text),
+      ['a', ''],
+    );
+  });
+
+  await test('file mentions parse tokens, quote names, and rank matches', async () => {
+    const chars = Array.from('look at @src/ui/App');
+    const token = mentionAt(chars, chars.length, chars.indexOf('@'));
+    assert.equal(token?.query, 'src/ui/App');
+    assert.equal(token?.end, chars.length);
+    assert.equal(mentionAt(Array.from('mail@example.com'), 16, 4), null);
+    assert.equal(mentionOpeningAt(Array.from('hi @'), 4), 3);
+    assert.equal(mentionOpeningAt(Array.from('mail@'), 5), null);
+    assert.equal(mentionNearby(chars, chars.length), chars.indexOf('@'));
+    assert.equal(mentionNearby(Array.from('mail@example.com'), 16), null);
+
+    const quoted = Array.from('@"my file.ts"');
+    const quotedToken = mentionAt(quoted, quoted.length - 1, 0);
+    assert.equal(quotedToken?.query, 'my file.ts');
+    assert.equal(quotedToken?.end, quoted.length);
+    assert.equal(mentionAt(quoted, quoted.length, 0), null, 'a closed mention ends the menu');
+    assert.equal(mentionText('my file.ts'), '@"my file.ts"');
+    assert.equal(mentionText('src/ui/App.tsx'), '@src/ui/App.tsx');
+
+    const files = [
+      'src/agent/prompt.ts',
+      'src/ui/App.tsx',
+      'src/ui/apply.ts',
+      'README.md',
+      'docs/application.md',
+    ];
+    assert.deepEqual(filterFiles(files, 'App').slice(0, 2), ['src/ui/App.tsx', 'src/ui/apply.ts']);
+    assert.equal(filterFiles(files, 'read')[0], 'README.md');
+    assert.deepEqual(filterFiles(files, 'agent/prompt'), ['src/agent/prompt.ts']);
+    assert.deepEqual(filterFiles(files, 'zzz'), []);
+  });
+
+  await test('the file index honours .gitignore and skips heavy directories', async () => {
+    const dir = await tempDir('kiro-index-');
+    await mkdir(path.join(dir, 'src'), { recursive: true });
+    await mkdir(path.join(dir, 'node_modules', 'pkg'), { recursive: true });
+    await writeFile(path.join(dir, 'src', 'app.ts'), 'x');
+    await writeFile(path.join(dir, 'notes.log'), 'x');
+    await writeFile(path.join(dir, 'node_modules', 'pkg', 'index.js'), 'x');
+    await writeFile(path.join(dir, '.gitignore'), '*.log\n');
+    try {
+      const files = await listProjectFiles(dir);
+      assert.ok(files.includes('src/app.ts'));
+      assert.ok(!files.includes('notes.log'), 'ignored files stay out of the index');
+      assert.ok(!files.includes('node_modules/pkg/index.js'));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   await test('approval policy tracks session allowances and yolo', async () => {
@@ -3500,6 +3612,7 @@ async function main(): Promise<void> {
       text: `line ${index}`,
     }));
     const palette = {
+      kind: 'commands' as const,
       commands: [
         { name: '/help', description: 'show commands and keys' },
         { name: '/model', usage: '<name>', description: 'switch profile' },
@@ -3522,6 +3635,17 @@ async function main(): Promise<void> {
 
     assert.deepEqual(applyPalette(base, null, 80, 10), base, 'no palette means no overlay');
     assert.equal(applyPalette(base, palette, 80, 3).length, 3, 'tiny terminals clamp the overlay');
+
+    const files = {
+      kind: 'files' as const,
+      files: ['src/ui/App.tsx', 'src/ui/mention.ts'],
+      activeIndex: 0,
+      header: 'files 1-2 of 2 · ↑/↓ move · Tab/Enter insert · Esc close',
+    };
+    const fileOverlay = applyPalette(base, files, 80, 10);
+    assert.match(fileOverlay[3]?.text ?? '', /files 1-2 of 2/);
+    assert.equal(flatten(fileOverlay[4]!), 'src/ui/App.tsx');
+    assert.equal(fileOverlay[4]?.inverse, true, 'the highlighted file is inverted');
     assert.equal(
       buildPaletteLines({ commands: [], activeIndex: 0 }, 80).length,
       7,
@@ -4096,6 +4220,89 @@ async function main(): Promise<void> {
     );
     assert.match(text, /\/model is a built-in, use \/skill model/);
     assert.ok(!text.includes('/anti-slop is a built-in'));
+  });
+
+  await test('doctor reports config, key, and endpoint problems', async () => {
+    const dir = await tempDir('kiro-doctor-');
+    const mock = await createMockServer({
+      models: ['test-model'],
+      turns: [{ type: 'text', text: 'OK' }],
+    });
+    const project = path.join(dir, 'project');
+    await mkdir(project, { recursive: true });
+    const configFile = path.join(dir, 'config.json');
+    const envFile = path.join(dir, '.env');
+    const writeConfig = (model = 'test-model'): Promise<void> =>
+      writeFile(
+        configFile,
+        JSON.stringify({
+          activeProfile: 'test',
+          profiles: {
+            test: {
+              type: 'openai',
+              baseUrl: `${mock.url}/v1`,
+              apiKeyEnv: 'DOCTOR_KEY',
+              model,
+            },
+          },
+        }),
+      );
+    await writeConfig();
+    await writeFile(envFile, 'DOCTOR_KEY=sk-doctor-secret-1234\n', { mode: 0o600 });
+
+    const env = { ...process.env, KIRO_CONFIG_PATH: configFile, KIRO_ENV_PATH: envFile, HOME: dir };
+    delete env.DOCTOR_KEY;
+    const cliPath = path.join(process.cwd(), 'src', 'index.tsx');
+    const tsxCli = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const run = (args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [tsxCli, cliPath, ...args], { cwd: project, env });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (chunk: string) => {
+          stdout += chunk;
+        });
+        child.stderr.on('data', (chunk: string) => {
+          stderr += chunk;
+        });
+        child.on('error', reject);
+        child.on('close', (status) => resolve({ status, stdout, stderr }));
+      });
+
+    try {
+      const healthy = await run(['doctor']);
+      assert.equal(healthy.status, 0, healthy.stderr);
+      assert.match(healthy.stdout, /ok\s+Config/);
+      assert.match(healthy.stdout, /GET .*\/models returned 1 model/);
+      assert.ok(!healthy.stdout.includes('sk-doctor-secret-1234'), 'doctor never prints the key');
+
+      const tested = await run(['doctor', '--test']);
+      assert.equal(tested.status, 0, tested.stderr);
+      assert.match(tested.stdout, /Connection OK/);
+
+      await writeConfig('other-model');
+      const mismatch = await run(['doctor']);
+      assert.equal(mismatch.status, 0, mismatch.stderr);
+      assert.match(mismatch.stdout, /not in the endpoint's list/);
+
+      await writeFile(envFile, 'OTHER=1\n', { mode: 0o600 });
+      const missing = await run(['doctor', '--offline']);
+      assert.equal(missing.status, 1);
+      assert.match(missing.stdout, /missing \(\$DOCTOR_KEY\)/);
+
+      await writeFile(configFile, '{ not json');
+      const broken = await run(['doctor', '--offline']);
+      assert.equal(broken.status, 1);
+      assert.match(broken.stdout, /invalid/);
+
+      const usage = await run(['doctor', '--nope']);
+      assert.equal(usage.status, 2);
+    } finally {
+      await mock.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   console.log('');

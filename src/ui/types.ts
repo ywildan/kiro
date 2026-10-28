@@ -67,8 +67,23 @@ export type ViewItem =
   | NoticeItem;
 
 /** Slash-command palette data; MessageList draws it over the transcript's last rows. */
-export interface PaletteState {
-  commands: { name: string; usage?: string; description: string }[];
-  /** Index into `commands`, relative to the visible window. */
-  activeIndex: number;
+export interface PaletteCommand {
+  name: string;
+  usage?: string;
+  description: string;
 }
+
+export type PaletteState =
+  | {
+      kind: 'commands';
+      commands: PaletteCommand[];
+      /** Index into `commands`, relative to the visible window. */
+      activeIndex: number;
+    }
+  | {
+      kind: 'files';
+      files: string[];
+      /** Index into `files`, relative to the visible window. */
+      activeIndex: number;
+      header: string;
+    };

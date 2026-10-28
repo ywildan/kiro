@@ -1,83 +1,16 @@
 import { spawn } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { Tool } from './types.js';
 import { denied, ok, toolError } from './types.js';
 import { matchGlob } from './glob.js';
-import { isIgnored, parseIgnoreFile, type IgnoreRule } from './ignore.js';
 import { booleanArg, displayPath, integerArg, resolvePath, stringArg } from './paths.js';
+import { ALWAYS_SKIP, walkTree } from './walk.js';
 
 const GLOB_LIMIT = 200;
-const MAX_WALK_ENTRIES = 200_000;
 const MAX_GREP_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_GREP_LINE_CHARS = 500;
 const MAX_CAPTURE_CHARS = 4_000_000;
-const ALWAYS_SKIP = new Set(['node_modules', '.git', 'dist', 'build']);
-
-interface WalkVisit {
-  abs: string;
-  rel: string;
-  isDir: boolean;
-}
-
-interface WalkOptions {
-  cwd: string;
-  rootAbs: string;
-  signal: AbortSignal;
-  visit(entry: WalkVisit): boolean | void | Promise<boolean | void>;
-}
-
-async function readIgnoreRules(dirAbs: string, baseRel: string): Promise<IgnoreRule[]> {
-  try {
-    return parseIgnoreFile(await readFile(path.join(dirAbs, '.gitignore'), 'utf8'), baseRel);
-  } catch {
-    return [];
-  }
-}
-
-/** Depth-first walk that honours .gitignore and always skips heavy directories. */
-async function walkTree(options: WalkOptions): Promise<void> {
-  const { cwd, rootAbs, signal, visit } = options;
-  const rootRel = path.relative(cwd, rootAbs).split(path.sep).join('/');
-  let visited = 0;
-  let stopped = false;
-
-  const visitDir = async (dirAbs: string, relDir: string, inherited: IgnoreRule[]): Promise<void> => {
-    if (stopped || signal.aborted) return;
-    const rules = [...inherited, ...(await readIgnoreRules(dirAbs, relDir))];
-    let entries;
-    try {
-      entries = await readdir(dirAbs, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      if (stopped || signal.aborted) return;
-      if (entry.isSymbolicLink()) continue;
-      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
-      const isDir = entry.isDirectory();
-      if (isDir && ALWAYS_SKIP.has(entry.name)) continue;
-      if (isIgnored(rules, rel, isDir)) continue;
-      visited++;
-      if (visited > MAX_WALK_ENTRIES) {
-        stopped = true;
-        return;
-      }
-      const abs = path.join(dirAbs, entry.name);
-      if ((await visit({ abs, rel, isDir })) === false) {
-        stopped = true;
-        return;
-      }
-      if (isDir) {
-        await visitDir(abs, rel, rules);
-        if (stopped) return;
-      }
-    }
-  };
-
-  await visitDir(rootAbs, rootRel, []);
-}
 
 const globTool: Tool = {
   readOnly: true,

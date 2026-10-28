@@ -120,6 +120,16 @@ kiro update    # npm install -g @ywldan/kiro@latest
 
 `check` exits `0` when current, `1` when an update exists, and `2` when the registry cannot be reached. `update` prints npm's output and needs the permissions of a global install.
 
+### Diagnostics
+
+```bash
+kiro doctor              # config, key storage, and endpoint checks
+kiro doctor --offline    # skip the network checks
+kiro doctor --test       # also send a small chat completion
+```
+
+`doctor` checks the Node version, the config file, `.env` permissions, the active profile's key, and `GET /models`. Each line is marked `ok`, `warn`, `fail`, or `skip`, with a suggested fix when something is wrong. It never prints a key. Exit code is `0` when no check fails and `1` otherwise. `--profile <name>` inspects another profile. A missing `GET /models` is only a warning, because some servers do not implement it.
+
 ### Where keys live
 
 `config.json` stores only `apiKeyEnv`, the name of a variable. Values live in the environment or in `~/.kiro/.env`:
@@ -235,6 +245,7 @@ kiro [options]
 
   kiro check         Compare the installed version with the latest on npm
   kiro update        Install the latest version from npm globally
+  kiro doctor        Check Node, config, key storage, and the active endpoint
 ```
 
 `--flag=value` works too. CLI overrides last for the current process only.
@@ -262,6 +273,7 @@ Exit codes: `0` success, `1` model/tool/session error, `2` usage error, `130` ca
 | Key | Action |
 | --- | --- |
 | `Enter` | Send the prompt, or run the highlighted `/` command |
+| `Ctrl+J`, `Alt+Enter`, or `\` + Enter | Start a new line without sending |
 | `Ctrl+C` | Press twice to exit; while a turn runs, the first press cancels it |
 | `PgUp` / `PgDn` | Scroll the history (the wheel works too, unless you pass `--no-mouse`) |
 | `Ctrl+O` | Expand or collapse the full output of the most recent tool call |
@@ -273,6 +285,10 @@ Exit codes: `0` success, `1` model/tool/session error, `2` usage error, `130` ca
 | `Ctrl+U` / `Ctrl+K` | Delete before / after the cursor |
 | `Ctrl+W` | Delete the previous word |
 | Left / Right / Home / End | Move the cursor |
+
+The input grows to six rows and scrolls with the cursor. Text pasted from another window keeps its line breaks and is not sent until you press Enter.
+
+Type `@` to pick a file from the project. The list respects `.gitignore` and skips `node_modules`, `.git`, `dist`, and `build`. Use `↑`/`↓` to move, `Tab` or `Enter` to insert the path, and `Esc` to close the list without clearing the prompt. Names with spaces are inserted quoted.
 
 The status bar shows the profile, model, working directory, context meter (`ctx 42k/128k`), queued message count, and state (`ready`, `thinking…`, `replying…`, `running <tool>…`, `approval needed`, `cancelling…`, `Ctrl+C again to quit`). Long profile names are shortened in the middle. On wide terminals the context meter moves into the Usage card.
 
@@ -484,6 +500,7 @@ test/
 
 - Only the `openai` provider type. Anthropic-style APIs are not supported.
 - Model discovery assumes an OpenAI-compatible `GET /models`. Endpoints without it work, but the model id must be typed manually.
+- `@` lists files only and stops at 50,000 paths; directories and ignored files are not offered.
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
 - No sub-agents, MCP, plugins, web search, image input, themes, or git integration.
 - Sessions are single-process and stored as plaintext JSON. There is no delete or rename command and no cross-directory session browser; `/export` writes a Markdown transcript you can keep.

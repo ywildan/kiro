@@ -46,6 +46,7 @@ export async function buildSystemPrompt(cwd: string): Promise<string> {
     '- Use apply_patch for coordinated changes across multiple files, or when you already have a unified diff. Patches are validated before anything is written.',
     '- Use write_file only for new files or complete rewrites.',
     '- All file paths are resolved relative to the working directory. Paths escaping it require user approval.',
+    '- A path written as @path in a user message points at a file in the working directory. Read it with read_file before relying on its contents.',
     '- Prefer run_command for builds, tests, and quick checks so you can verify your work. Commands run in the working directory.',
     '- Tool output may be truncated. Use read_file offsets, narrower grep patterns/globs, or smaller result limits if you need more detail.',
     '- If a tool returns an error, read it carefully and adjust; edit_file/multi_edit errors include a hint about the closest line or whitespace mismatch.',

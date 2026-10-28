@@ -132,7 +132,7 @@ const clamp = (value: number, max: number): number => Math.max(0, Math.min(value
 
 const ANSI_TOKEN = new RegExp(`(${ANSI_CSI.source}|${ANSI_OSC.source})`, 'g');
 
-/** Above this chunk size a trailing newline is treated as pasted text, not Enter. */
+/** Above this chunk size a trailing carriage return is treated as pasted text, not Enter. */
 const MAX_SUBMIT_CHUNK = 200;
 
 /**
@@ -148,7 +148,7 @@ export function parseInputChunk(text: string): InputOp[] {
 
   const lineBreaks = (text.match(/[\r\n]/g) ?? []).length;
   const trailingEnter =
-    lineBreaks === 1 && text.length <= MAX_SUBMIT_CHUNK && /[\r\n]$/.test(text);
+    lineBreaks === 1 && text.length <= MAX_SUBMIT_CHUNK && text.endsWith('\r');
 
   const ops: InputOp[] = [];
   let buffer = '';
@@ -169,18 +169,26 @@ export function parseInputChunk(text: string): InputOp[] {
       }
       continue;
     }
-    for (const char of token) {
+    for (let index = 0; index < token.length; index++) {
+      const char = token[index]!;
       const code = char.codePointAt(0) ?? 0;
       if (char === '\x7f' || char === '\x08') {
         flush();
         ops.push({ type: 'backspace', count: 1 });
-      } else if (char === '\r' || char === '\n') {
+      } else if (char === '\r') {
         if (trailingEnter) {
-          flush();
-          ops.push({ type: 'submit' });
+          if (buffer.endsWith('\\')) {
+            buffer = `${buffer.slice(0, -1)}\n`;
+          } else {
+            flush();
+            ops.push({ type: 'submit' });
+          }
         } else {
-          buffer += ' ';
+          buffer += '\n';
+          if (token[index + 1] === '\n') index++;
         }
+      } else if (char === '\n') {
+        buffer += '\n';
       } else if (char === '\t') {
         buffer += '    ';
       } else if (code < 32 || code === 127) {
@@ -267,6 +275,170 @@ export function applyInputOps(
     current = applyInputOp(current, op);
   }
   return { state: current, submitted: false };
+}
+
+export const PASTE_START = '\x1b[200~';
+export const PASTE_END = '\x1b[201~';
+const PASTE_START_BARE = '[200~';
+const PASTE_END_BARE = '[201~';
+
+export interface PasteState {
+  open: boolean;
+  buffer: string;
+  /** A partial start marker held back until the next chunk completes it. */
+  pending: string;
+}
+
+export function normalizePastedText(text: string): string {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .replace(/\t/g, '    ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+}
+
+function findPasteStart(text: string): { index: number; length: number } | null {
+  const escaped = text.indexOf(PASTE_START);
+  if (escaped !== -1) return { index: escaped, length: PASTE_START.length };
+  if (text.startsWith(PASTE_START_BARE)) return { index: 0, length: PASTE_START_BARE.length };
+  return null;
+}
+
+function findPasteEnd(text: string): { index: number; length: number } | null {
+  const escaped = text.indexOf(PASTE_END);
+  const bare = text.indexOf(PASTE_END_BARE);
+  if (escaped === -1 && bare === -1) return null;
+  if (escaped === -1) return { index: bare, length: PASTE_END_BARE.length };
+  if (bare === -1 || escaped <= bare) return { index: escaped, length: PASTE_END.length };
+  return { index: bare, length: PASTE_END_BARE.length };
+}
+
+/** Longest suffix that could still become a start marker. */
+function pendingStart(text: string): string {
+  const limit = Math.min(PASTE_START.length - 1, text.length);
+  for (let length = limit; length >= 3; length--) {
+    const suffix = text.slice(-length);
+    if (PASTE_START.startsWith(suffix) || PASTE_START_BARE.startsWith(suffix)) return suffix;
+  }
+  return '';
+}
+
+/**
+ * Consumes bracketed paste markers from a raw input chunk. Ink strips one
+ * leading escape byte per chunk and a terminal may split a marker across
+ * reads, so both cases are buffered.
+ */
+export function feedPaste(
+  state: PasteState,
+  input: string,
+): { state: PasteState; text: string | null; consumed: boolean } {
+  if (state.open) {
+    const combined = state.buffer + input;
+    const end = findPasteEnd(combined);
+    if (!end) {
+      return {
+        state: { open: true, buffer: combined, pending: '' },
+        text: null,
+        consumed: true,
+      };
+    }
+    const text =
+      normalizePastedText(combined.slice(0, end.index)) +
+      normalizePastedText(combined.slice(end.index + end.length));
+    return { state: { open: false, buffer: '', pending: '' }, text, consumed: true };
+  }
+
+  const hadPending = state.pending !== '';
+  const combined = state.pending + input;
+  const start = findPasteStart(combined);
+  if (!start) {
+    const pending = pendingStart(combined);
+    if (pending.length >= 3 && pending.length === combined.length) {
+      return { state: { open: false, buffer: '', pending }, text: null, consumed: true };
+    }
+    if (!hadPending) {
+      return { state: { open: false, buffer: '', pending: '' }, text: null, consumed: false };
+    }
+    const flushed = combined.slice(0, combined.length - pending.length);
+    return {
+      state: { open: false, buffer: '', pending },
+      text: flushed ? normalizePastedText(flushed) : null,
+      consumed: true,
+    };
+  }
+
+  const prefix = combined.slice(0, start.index);
+  const after = combined.slice(start.index + start.length);
+  const end = findPasteEnd(after);
+  if (!end) {
+    return {
+      state: { open: true, buffer: after, pending: '' },
+      text: prefix ? normalizePastedText(prefix) : null,
+      consumed: true,
+    };
+  }
+  const pasted = after.slice(0, end.index);
+  const rest = after.slice(end.index + end.length);
+  return {
+    state: { open: false, buffer: '', pending: '' },
+    text: normalizePastedText(prefix + pasted) + normalizePastedText(rest),
+    consumed: true,
+  };
+}
+
+export interface InputLine {
+  /** Absolute character index of the first character on this line. */
+  start: number;
+  /** Absolute character index one past the last character on this line. */
+  end: number;
+  text: string;
+  /** True when the line was split by width rather than by a newline. */
+  wrapped: boolean;
+}
+
+/** Splits input into visual lines, honouring explicit newlines and hard wrapping. */
+export function layoutInput(chars: string[], width: number, masked = false): InputLine[] {
+  const maxWidth = Math.max(1, width);
+  const lines: InputLine[] = [];
+  let start = 0;
+  let text = '';
+  let used = 0;
+
+  const flush = (end: number, wrapped: boolean): void => {
+    lines.push({ start, end, text, wrapped });
+    start = end;
+    text = '';
+    used = 0;
+  };
+
+  for (let index = 0; index < chars.length; index++) {
+    const char = masked ? '•' : chars[index]!;
+    if (char === '\n') {
+      flush(index, false);
+      start = index + 1;
+      continue;
+    }
+    const charWidth = Math.max(1, stringWidth(char));
+    if (used > 0 && used + charWidth > maxWidth) flush(index, true);
+    text += char;
+    used += charWidth;
+  }
+  flush(chars.length, false);
+  return lines;
+}
+
+/** Finds the visual line holding the caret; wraps forward, newlines stay put. */
+export function cursorLineIndex(lines: InputLine[], cursor: number): number {
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (cursor < line.start) return Math.max(0, index - 1);
+    if (cursor < line.end) return index;
+    if (cursor === line.end) {
+      const next = lines[index + 1];
+      if (line.wrapped && next && next.start === cursor) return index + 1;
+      return index;
+    }
+  }
+  return lines.length - 1;
 }
 
 export function formatDuration(ms: number): string {

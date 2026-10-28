@@ -62,6 +62,7 @@ import {
   type SlashCommand,
 } from './commands.js';
 import { defaultExportPath, renderTranscriptMarkdown } from './export.js';
+import { listProjectFiles } from './file-index.js';
 import { buildResumedView } from './history.js';
 import { Input } from './Input.js';
 import { MessageList } from './MessageList.js';
@@ -201,6 +202,18 @@ export function App({
   const [usageCardEnabled, setUsageCardEnabled] = useState(true);
   const [mouseOn, setMouseOn] = useState(mouseEnabled);
   const [expandedToolId, setExpandedToolId] = useState<number | null>(null);
+  const [inputRows, setInputRows] = useState(1);
+  const fileIndexRef = useRef<{ cwd: string; files: string[]; builtAt: number } | null>(null);
+
+  const loadFileIndex = useCallback(async (): Promise<string[]> => {
+    const cached = fileIndexRef.current;
+    if (cached && cached.cwd === cwd && Date.now() - cached.builtAt < 5000) {
+      return cached.files;
+    }
+    const files = await listProjectFiles(cwd);
+    fileIndexRef.current = { cwd, files, builtAt: Date.now() };
+    return files;
+  }, [cwd]);
 
   const messagesRef = useRef<ChatMessage[]>(
     (initialSession?.messages ?? []).filter((message) => message.role !== 'system'),
@@ -1537,6 +1550,7 @@ export function App({
       }
       const trimmed = value.trim();
       if (!trimmed) return;
+      const isCommand = trimmed.startsWith('/') && !trimmed.includes('\n');
       if (wizardActiveRef.current || transitioningRef.current) {
         // The wizard owns the keyboard; ignore stray input.
         return;
@@ -1545,7 +1559,7 @@ export function App({
         // Type-ahead: the message runs as soon as the current turn finishes.
         queuedRef.current.push(trimmed);
         setQueuedCount(queuedRef.current.length);
-        if (!trimmed.startsWith('/')) {
+        if (!isCommand) {
           setItems((current) => [
             ...current,
             { kind: 'user', id: nextItemIdRef.current++, text: trimmed },
@@ -1557,7 +1571,7 @@ export function App({
         );
         return;
       }
-      if (trimmed.startsWith('/')) {
+      if (isCommand) {
         void handleCommand(trimmed).finally(() => drainQueueRef.current?.());
         return;
       }
@@ -1665,9 +1679,14 @@ export function App({
   const pickerPopup =
     pickerOpen && !pendingApproval ? pickerPopupRect(columns, rows) : null;
   const pickerInline = pickerOpen && !pendingApproval && pickerPopup === null;
+  const extraInputRows = pendingApproval || pickerInline ? 0 : Math.max(0, inputRows - 1);
   const viewportHeight = Math.max(
     3,
-    rows - 5 - (pendingApproval ? 12 : 0) - (pickerInline ? PICKER_INLINE_ROWS : 0),
+    rows -
+      5 -
+      extraInputRows -
+      (pendingApproval ? 12 : 0) -
+      (pickerInline ? PICKER_INLINE_ROWS : 0),
   );
   const showUsageCard = usageCardEnabled && shouldShowUsageCard(columns, viewportHeight);
   const chatWidth = showUsageCard ? Math.max(40, width - USAGE_CARD_WIDTH - USAGE_CARD_GAP) : width;
@@ -1719,9 +1738,13 @@ export function App({
           width={width}
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
+          fileMenu={!wizardActive && !wizardPrompt}
+          loadFiles={loadFileIndex}
+          maxRows={Math.max(1, Math.min(6, rows - 9))}
           history={wizardPrompt || wizardActive ? undefined : promptHistory}
           slashCommands={[...SLASH_COMMANDS, ...skillCommands]}
           onPaletteChange={setPalette}
+          onHeightChange={setInputRows}
           placeholder={
             pickerOpen
               ? 'Model picker open · Esc to close'

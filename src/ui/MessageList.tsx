@@ -259,6 +259,32 @@ const PALETTE_ROWS = 6;
 
 /** Header plus the visible command rows; padded so filtering never changes its height. */
 export function buildPaletteLines(palette: PaletteState, width: number): RenderLine[] {
+  if (palette.kind === 'files') {
+    const header: RenderLine = {
+      prefix: '  ',
+      text: truncateToWidth(palette.header, width),
+      dim: true,
+    };
+    const rows: RenderLine[] = palette.files.slice(0, PALETTE_ROWS).map((file, index) => {
+      const active = index === palette.activeIndex;
+      const slash = file.lastIndexOf('/');
+      const directory = slash === -1 ? '' : file.slice(0, slash + 1);
+      const name = file.slice(slash + 1);
+      return {
+        prefix: active ? '› ' : '  ',
+        prefixColor: active ? 'cyan' : undefined,
+        text: '',
+        segments: [
+          { text: directory, dim: true },
+          { text: name, bold: active },
+        ],
+        inverse: active,
+      };
+    });
+    while (rows.length < PALETTE_ROWS) rows.push({ prefix: '', text: '' });
+    return [header, ...rows];
+  }
+
   const header: RenderLine = {
     prefix: '  ',
     text: truncateToWidth('commands · ↑/↓ move · Tab complete · Enter run', width),
