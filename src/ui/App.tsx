@@ -42,12 +42,14 @@ import {
   dropIncompleteToolCalls,
   formatSessionTime,
   isSessionId,
+  listAllSessions,
   listSessions,
   loadSession,
   newSessionId,
   projectSessionsDir,
   saveSession,
   titleFromMessages,
+  type AllSessionsResult,
   type SessionRecord,
   type SessionSummary,
 } from '../sessions.js';
@@ -68,6 +70,8 @@ import { Input } from './Input.js';
 import { MessageList } from './MessageList.js';
 import { MOUSE_OFF, MOUSE_ON } from './mouse.js';
 import { ModelPicker, type ModelRefreshResult } from './ModelPicker.js';
+import { SessionPicker } from './SessionPicker.js';
+import { SESSION_INLINE_ROWS, shortCwd } from './session-picker.js';
 import {
   PICKER_INLINE_ROWS,
   pickerPopupRect,
@@ -197,6 +201,7 @@ export function App({
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [sessionPicker, setSessionPicker] = useState<AllSessionsResult | null>(null);
   const [quitArmed, setQuitArmed] = useState(false);
   const [palette, setPalette] = useState<PaletteState | null>(null);
   const [usageCardEnabled, setUsageCardEnabled] = useState(true);
@@ -674,6 +679,15 @@ export function App({
     void refreshSkillCommands();
   }, [refreshSkillCommands]);
 
+  /** Loads the session list for the picker; other directories are grouped by cwd. */
+  const openSessionPicker = useCallback(async (): Promise<void> => {
+    try {
+      setSessionPicker(await listAllSessions(cwd, 20));
+    } catch (error) {
+      addNotice('error', error instanceof Error ? error.message : String(error));
+    }
+  }, [cwd, addNotice]);
+
   /** Mentions once per run when the model pulls instructions that came from the repo. */
   const noteProjectSkill = useCallback(
     async (rawArguments: string): Promise<void> => {
@@ -1028,6 +1042,7 @@ export function App({
               '',
               '  Model subcommands: /model <name> · /model add · /model edit [name] ·',
               '                     /model remove [name] · /model test [name] · /model list --remote',
+              '  Sessions: /resume opens a picker; ←/→ switches between this directory and others.',
               '',
               'Keys: Enter sends · / opens commands · PgUp/PgDn scrolls · Ctrl+O expands tool output ·',
               '      Tab completes a command · Esc cancels a wizard step · /mouse toggles wheel scroll',
@@ -1242,36 +1257,54 @@ export function App({
         case '/resume': {
           transitioningRef.current = true;
           try {
+            if (command === '/resume' && !argument) {
+              await openSessionPicker();
+              return;
+            }
             if (command === '/sessions' || !argument) {
-              const { sessions, skipped } = await listSessions(cwd, 10);
-              listedSessionsRef.current = sessions;
-              if (sessions.length === 0) {
+              const data = await listAllSessions(cwd, 10);
+              listedSessionsRef.current = data.current;
+              const otherCount = data.others.reduce((total, group) => total + group.sessions.length, 0);
+              if (data.current.length === 0 && otherCount === 0) {
                 addNotice(
                   'info',
                   `No saved sessions for this directory yet. Sessions are stored in ${projectSessionsDir(cwd)}.`,
                 );
               } else {
-                const lines = sessions.map((session, index) => {
+                const lines: string[] = ['Sessions (most recent first):'];
+                lines.push(`This directory (${data.current.length}):`);
+                if (data.current.length === 0) lines.push('  (none)');
+                data.current.forEach((session, index) => {
                   const marker = session.id === sessionRef.current?.id ? '*' : ' ';
                   const messages = `${session.messageCount} msg${session.messageCount === 1 ? '' : 's'}`;
-                  return `${marker} ${index + 1}. ${session.id}  ${formatSessionTime(
-                    session.updatedAt,
-                  )}  ${messages}  ${session.title}`;
+                  lines.push(
+                    `${marker} ${index + 1}. ${session.id}  ${formatSessionTime(
+                      session.updatedAt,
+                    )}  ${messages}  ${session.title}`,
+                  );
                 });
-                addNotice(
-                  'info',
-                  [
-                    'Sessions (most recent first):',
-                    ...lines,
-                    '',
-                    'Use /resume <number|id> to load one.',
-                  ].join('\n'),
+                if (otherCount > 0) {
+                  lines.push('Other directories:');
+                  for (const group of data.others) {
+                    lines.push(`  ${shortCwd(group.cwd, cwd)}`);
+                    for (const session of group.sessions) {
+                      const messages = `${session.messageCount} msg${session.messageCount === 1 ? '' : 's'}`;
+                      lines.push(
+                        `    ${session.id}  ${formatSessionTime(session.updatedAt)}  ${messages}  ${session.title}`,
+                      );
+                    }
+                  }
+                }
+                lines.push(
+                  '',
+                  'Use /resume to pick a session, or /resume <number|id> for this directory.',
                 );
+                addNotice('info', lines.join('\n'));
               }
-              if (skipped > 0) {
+              if (data.skipped > 0) {
                 addNotice(
                   'muted',
-                  `Skipped ${skipped} unreadable session file${skipped === 1 ? '' : 's'}.`,
+                  `Skipped ${data.skipped} unreadable session file${data.skipped === 1 ? '' : 's'}.`,
                 );
               }
               return;
@@ -1506,6 +1539,7 @@ export function App({
       cwd,
       listRemoteModels,
       mouseOn,
+      openSessionPicker,
       persistSession,
       profileName,
       quit,
@@ -1520,6 +1554,19 @@ export function App({
       yolo,
     ],
   );
+
+  /** Resumes a picker selection only when it belongs to the current directory. */
+  const handleSessionPick = (session: SessionSummary): void => {
+    setSessionPicker(null);
+    if (path.resolve(session.cwd) !== path.resolve(cwd)) {
+      addNotice(
+        'info',
+        `Session ${session.id} belongs to ${shortCwd(session.cwd, cwd)}. Start kiro in that directory to resume it.`,
+      );
+      return;
+    }
+    void handleCommand(`/resume ${session.id}`);
+  };
 
   /** Runs the next queued item once the app is idle, including queued slash commands. */
   const drainQueue = useCallback((): void => {
@@ -1622,7 +1669,7 @@ export function App({
   useInput((input, key) => {
     if (key.ctrl && input === 'o') {
       if (wizardActiveRef.current || wizardPromptRef.current || pendingApprovalRef.current) return;
-      if (pickerOpen) return;
+      if (pickerOpen || sessionPicker !== null) return;
       expandLastToolOutput();
       return;
     }
@@ -1630,6 +1677,11 @@ export function App({
     if (pickerOpen) {
       disarmQuit();
       setPickerOpen(false);
+      return;
+    }
+    if (sessionPicker !== null) {
+      disarmQuit();
+      setSessionPicker(null);
       return;
     }
     if (wizardActiveRef.current) {
@@ -1677,16 +1729,22 @@ export function App({
   const activeProfile = runtimeConfig.profiles[profileName];
   const contextWindow = contextWindowFor(activeProfile);
   const pickerPopup =
-    pickerOpen && !pendingApproval ? pickerPopupRect(columns, rows) : null;
+    (pickerOpen || sessionPicker !== null) && !pendingApproval
+      ? pickerPopupRect(columns, rows)
+      : null;
   const pickerInline = pickerOpen && !pendingApproval && pickerPopup === null;
-  const extraInputRows = pendingApproval || pickerInline ? 0 : Math.max(0, inputRows - 1);
+  const sessionInline =
+    sessionPicker !== null && !pendingApproval && pickerPopup === null && !pickerOpen;
+  const extraInputRows =
+    pendingApproval || pickerInline || sessionInline ? 0 : Math.max(0, inputRows - 1);
   const viewportHeight = Math.max(
     3,
     rows -
       5 -
       extraInputRows -
       (pendingApproval ? 12 : 0) -
-      (pickerInline ? PICKER_INLINE_ROWS : 0),
+      (pickerInline ? PICKER_INLINE_ROWS : 0) -
+      (sessionInline ? SESSION_INLINE_ROWS : 0),
   );
   const showUsageCard = usageCardEnabled && shouldShowUsageCard(columns, viewportHeight);
   const chatWidth = showUsageCard ? Math.max(40, width - USAGE_CARD_WIDTH - USAGE_CARD_GAP) : width;
@@ -1701,7 +1759,9 @@ export function App({
           resetSignal={resetSignal}
           expandedToolId={expandedToolId}
           palette={palette}
-          interactive={!pendingApproval && !pickerOpen && !wizardActive && wizardPrompt === null}
+          interactive={
+            !pendingApproval && !pickerOpen && sessionPicker === null && !wizardActive && wizardPrompt === null
+          }
         />
         {showUsageCard ? (
           <Box marginLeft={USAGE_CARD_GAP} flexShrink={0}>
@@ -1731,10 +1791,19 @@ export function App({
           onRefresh={refreshProfileModels}
           onCancel={() => setPickerOpen(false)}
         />
+      ) : sessionInline && sessionPicker ? (
+        <SessionPicker
+          cwd={cwd}
+          data={sessionPicker}
+          activeSessionId={sessionRef.current?.id ?? null}
+          width={width}
+          onSelect={handleSessionPick}
+          onCancel={() => setSessionPicker(null)}
+        />
       ) : (
         <Input
           key={wizardPrompt?.id ?? 0}
-          disabled={pickerOpen}
+          disabled={pickerOpen || sessionPicker !== null}
           width={width}
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
@@ -1748,7 +1817,9 @@ export function App({
           placeholder={
             pickerOpen
               ? 'Model picker open · Esc to close'
-              : wizardPrompt
+              : sessionPicker
+                ? 'Session picker open · Esc to close'
+                : wizardPrompt
                 ? wizardPrompt.defaultValue && !wizardPrompt.mask
                   ? `${wizardPrompt.label} [${wizardPrompt.defaultValue}]`
                   : wizardPrompt.label
@@ -1788,6 +1859,18 @@ export function App({
             onSelect={(name, model) => void selectModel(name, model)}
             onRefresh={refreshProfileModels}
             onCancel={() => setPickerOpen(false)}
+          />
+        </Box>
+      ) : sessionPicker && pickerPopup ? (
+        <Box position="absolute" marginTop={pickerPopup.top} marginLeft={pickerPopup.left}>
+          <SessionPicker
+            cwd={cwd}
+            data={sessionPicker}
+            activeSessionId={sessionRef.current?.id ?? null}
+            width={pickerPopup.width}
+            height={pickerPopup.height}
+            onSelect={handleSessionPick}
+            onCancel={() => setSessionPicker(null)}
           />
         </Box>
       ) : null}

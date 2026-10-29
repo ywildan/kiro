@@ -93,11 +93,14 @@ import {
   dropIncompleteToolCalls,
   isSessionId,
   latestSession,
+  listAllSessions,
   listSessions,
   loadSession,
   projectSessionsDir,
   saveSession,
   titleFromMessages,
+  type AllSessionsResult,
+  type SessionSummary,
 } from '../src/sessions.js';
 import { ApprovalPolicy } from '../src/ui/approval-policy.js';
 import { applyPalette, buildLines, buildPaletteLines } from '../src/ui/MessageList.js';
@@ -117,6 +120,20 @@ import {
   withProfileModels,
 } from '../src/ui/model-picker.js';
 import { ModelPicker } from '../src/ui/ModelPicker.js';
+import { SessionPicker } from '../src/ui/SessionPicker.js';
+import {
+  SESSION_INLINE_ROWS,
+  buildSessionRows,
+  filterSessions,
+  sessionCounts,
+  sessionEmptyText,
+  sessionRange,
+  sessionRowItems,
+  sessionRowLines,
+  sessionRowText,
+  sessionTabLabel,
+  shortCwd,
+} from '../src/ui/session-picker.js';
 import { formatProfileList } from '../src/ui/profile-list.js';
 import {
   SLASH_COMMANDS,
@@ -1642,6 +1659,162 @@ async function main(): Promise<void> {
       await rm(workspace, { recursive: true, force: true });
       await rm(other, { recursive: true, force: true });
     }
+  });
+
+  await test('sessions list across project directories with grouping', async () => {
+    const root = await tempDir('kiro-session-all-');
+    const workspace = await tempDir('kiro-session-all-cwd-');
+    const other = await tempDir('kiro-session-all-other-');
+    const emptyRoot = await tempDir('kiro-session-all-empty-');
+    const previous = process.env.KIRO_SESSIONS_DIR;
+    process.env.KIRO_SESSIONS_DIR = root;
+    try {
+      const mine = await saveSession({
+        cwd: workspace,
+        profile: 'default',
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'Mine' }],
+      });
+      await sleep(20);
+      const theirs = await saveSession({
+        cwd: other,
+        profile: 'default',
+        model: 'mock-model',
+        messages: [{ role: 'user', content: 'Theirs' }],
+      });
+
+      const all = await listAllSessions(workspace);
+      assert.deepEqual(all.current.map((session) => session.id), [mine.id]);
+      assert.equal(all.current[0]?.cwd, path.resolve(workspace));
+      assert.equal(all.others.length, 1);
+      assert.equal(all.others[0]?.cwd, path.resolve(other));
+      assert.deepEqual(all.others[0]?.sessions.map((session) => session.id), [theirs.id]);
+      assert.equal(all.skipped, 0);
+
+      await writeFile(path.join(projectSessionsDir(other), 'broken.json'), '{nope');
+      const withBroken = await listAllSessions(workspace);
+      assert.equal(withBroken.skipped, 1);
+      assert.deepEqual(withBroken.others[0]?.sessions.map((session) => session.id), [theirs.id]);
+      assert.deepEqual(
+        (await listSessions(workspace)).sessions.map((session) => session.id),
+        [mine.id],
+      );
+
+      process.env.KIRO_SESSIONS_DIR = emptyRoot;
+      assert.deepEqual(await listAllSessions(workspace), {
+        current: [],
+        others: [],
+        skipped: 0,
+      });
+    } finally {
+      if (previous === undefined) delete process.env.KIRO_SESSIONS_DIR;
+      else process.env.KIRO_SESSIONS_DIR = previous;
+      await rm(root, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+      await rm(other, { recursive: true, force: true });
+      await rm(emptyRoot, { recursive: true, force: true });
+    }
+  });
+
+  await test('session picker groups tabs and formats rows', async () => {
+    const currentCwd = path.join(await tempDir('kiro-picker-cwd-'), 'shop');
+    const otherCwd = path.join(await tempDir('kiro-picker-other-'), 'site');
+    const summary = (
+      id: string,
+      cwd: string,
+      title: string,
+      updatedAt: string,
+      messageCount = 2,
+    ): SessionSummary => ({
+      id,
+      cwd,
+      profile: 'default',
+      model: 'mock-model',
+      title,
+      createdAt: updatedAt,
+      updatedAt,
+      messageCount,
+    });
+    const data: AllSessionsResult = {
+      current: [
+        summary('20261030-101200-aaaa', currentCwd, 'Dashboard toko', '2026-10-30T10:12:00.000Z', 18),
+        summary('20261029-221000-bbbb', currentCwd, 'Fix tests', '2026-10-29T22:10:00.000Z', 7),
+      ],
+      others: [
+        {
+          cwd: otherCwd,
+          sessions: [
+            summary('20261028-090100-cccc', otherCwd, 'Checkout flow', '2026-10-28T09:01:00.000Z', 12),
+          ],
+        },
+      ],
+      skipped: 0,
+    };
+
+    assert.deepEqual(sessionCounts(data), { current: 2, others: 1 });
+    assert.equal(sessionTabLabel('current', sessionCounts(data)), 'This directory (2)');
+    assert.equal(sessionTabLabel('others', sessionCounts(data)), 'Other directories (1)');
+    assert.equal(shortCwd(currentCwd, currentCwd), '.');
+
+    const currentRows = buildSessionRows(data, 'current', currentCwd);
+    assert.equal(currentRows.length, 2);
+    assert.deepEqual(sessionRowLines(currentRows), [0, 1]);
+    assert.match(sessionRowText(data.current[0]!, true), /^\* 20261030/);
+    assert.match(sessionRowText(data.current[0]!, false), /^  20261030/);
+
+    const otherRows = buildSessionRows(data, 'others', currentCwd);
+    assert.equal(otherRows[0]?.kind, 'header');
+    assert.match(otherRows[0]?.kind === 'header' ? otherRows[0].text : '', /site \(1\)/);
+    assert.equal(sessionRowItems(otherRows).length, 1);
+    assert.deepEqual(sessionRange(otherRows, 0, otherRows.length), {
+      above: 0,
+      below: 0,
+      first: 1,
+      last: 1,
+      total: 1,
+    });
+
+    assert.equal(filterSessions(data.current, 'dashboard').length, 1);
+    assert.equal(filterSessions(data.current, 'zzz').length, 0);
+    assert.equal(filterSessions(data.others[0]!.sessions, 'checkout').length, 1);
+    assert.match(sessionEmptyText('current', '', false), /No saved sessions/);
+    assert.match(sessionEmptyText('others', 'zzz', true), /No sessions match/);
+
+    const rendered = renderToString(
+      React.createElement(SessionPicker, {
+        cwd: currentCwd,
+        data,
+        width: 76,
+        height: 16,
+        onSelect: () => {},
+        onCancel: () => {},
+      }),
+      { columns: 120 },
+    ).trimEnd();
+    const lines = rendered.split('\n');
+    assert.equal(lines.length, 16, 'the session dialog keeps a fixed frame');
+    for (const line of lines) {
+      assert.ok(displayWidth(line) <= 76, `popup line fits: ${line}`);
+    }
+    assert.match(rendered, /Sessions/);
+    assert.match(rendered, /This directory \(2\)/);
+    assert.match(rendered, /Other directories \(1\)/);
+    assert.match(rendered, /1-2 of 2/);
+    assert.match(rendered, /Esc close/);
+
+    const empty = renderToString(
+      React.createElement(SessionPicker, {
+        cwd: currentCwd,
+        data: { current: [], others: [], skipped: 0 },
+        width: 60,
+        onSelect: () => {},
+        onCancel: () => {},
+      }),
+      { columns: 100 },
+    ).trimEnd();
+    assert.match(empty, /No saved sessions for this directory/);
+    assert.ok(displayWidth(empty.split('\n')[0] ?? '') <= 60);
+    assert.ok(SESSION_INLINE_ROWS >= 12);
   });
 
   await test('resumed history rebuilds tool blocks and statuses', async () => {

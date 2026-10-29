@@ -334,8 +334,9 @@ Tool results are one-line summaries. `Ctrl+O` expands the latest result inline; 
 | `/skill <name> [request]` | Load a skill, optionally with your request in the same line |
 | `/<skill name> [request]` | Call an installed skill directly, e.g. `/anti-slop rewrite this paragraph` |
 | `/compact` | Summarize older turns now, keeping the last four user turns verbatim |
-| `/sessions` | List saved sessions for this working directory |
-| `/resume <n\|id>` | Resume a session by list number or id (prefixes work) |
+| `/sessions` | List saved sessions for this directory and for other directories |
+| `/resume` | Open the session picker (tabs for this directory and others) |
+| `/resume <n\|id>` | Resume a session from this directory by list number or id (prefixes work) |
 | `/undo` | Revert the most recent write, edit, or patch (repeat to step further back) |
 | `/clear` | Start a new session, keeping the old one on disk |
 | `/export [file]` | Write the transcript (with full tool output) to a Markdown file |
@@ -365,7 +366,7 @@ kiro --continue          # most recent session for this directory
 kiro --resume <id>       # a specific session
 ```
 
-`/sessions` and `/resume <n|id>` do the same from inside the TUI. `/clear` starts a new session without deleting the old one. Kiro does not auto-resume; without a flag it starts fresh.
+`/sessions` and `/resume <n|id>` do the same from inside the TUI. `/resume` without arguments opens a picker with two tabs: `This directory` and `Other directories`, grouped by folder. Use `←`/`→` to switch tabs, `↑`/`↓` to move, type to filter by title, id, or path, `Enter` to resume, and `Esc` to close. Sessions from other directories are listed with their folder; selecting one shows where to start Kiro to resume it, because tool calls always run in the current working directory. `/clear` starts a new session without deleting the old one. Kiro does not auto-resume; without a flag it starts fresh.
 
 Session files are plaintext and contain prompts, code from tools, and command output. They never contain API keys, but treat them like shell history.
 
@@ -503,7 +504,7 @@ test/
 - `@` lists files only and stops at 50,000 paths; directories and ignored files are not offered.
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
 - No sub-agents, MCP, plugins, web search, image input, themes, or git integration.
-- Sessions are single-process and stored as plaintext JSON. There is no delete or rename command and no cross-directory session browser; `/export` writes a Markdown transcript you can keep.
+- Sessions are single-process and stored as plaintext JSON. There is no delete or rename command. The `/resume` picker lists other directories, but a session can only be resumed from its own directory; `/export` writes a Markdown transcript you can keep.
 - `/undo` covers `write_file`, `edit_file`, `multi_edit`, and `apply_patch` only. It keeps the last 30 calls, and `run_command` changes are outside its reach; use Git for a complete safety net.
 - Prompt history is plaintext, capped at 200 entries per directory, and only recalled in the TUI (not in `-p` mode).
 - Only contiguous read-only tool calls run in parallel; writes, edits, patches, and commands stay sequential.

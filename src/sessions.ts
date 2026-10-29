@@ -23,6 +23,7 @@ export interface SessionRecord {
 
 export interface SessionSummary {
   id: string;
+  cwd: string;
   profile: string;
   model: string;
   title: string;
@@ -44,6 +45,20 @@ export interface SaveSessionInput {
 
 export interface SessionListResult {
   sessions: SessionSummary[];
+  skipped: number;
+}
+
+/** Sessions grouped by the directory they were saved from. */
+export interface SessionGroup {
+  cwd: string;
+  sessions: SessionSummary[];
+}
+
+export interface AllSessionsResult {
+  /** Sessions saved for the directory Kiro is running in. */
+  current: SessionSummary[];
+  /** Sessions from every other directory, newest group first. */
+  others: SessionGroup[];
   skipped: number;
 }
 
@@ -211,18 +226,7 @@ export async function saveSession(input: SaveSessionInput): Promise<SessionRecor
   return record;
 }
 
-export async function loadSession(cwd: string, id: string): Promise<SessionRecord> {
-  const file = sessionFile(cwd, id);
-  let raw: string;
-  try {
-    raw = await readFile(file, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new SessionError(`Session "${id}" was not found for this directory.`);
-    }
-    throw new SessionError(`Could not read session "${id}": ${(error as Error).message}`);
-  }
-
+function parseSessionRecord(raw: string, id: string, expectedCwd?: string): SessionRecord {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -235,7 +239,10 @@ export async function loadSession(cwd: string, id: string): Promise<SessionRecor
       `Session "${id}" uses unsupported version ${String(parsed.version)}; expected ${SESSION_VERSION}.`,
     );
   }
-  if (typeof parsed.cwd !== 'string' || path.resolve(parsed.cwd) !== path.resolve(cwd)) {
+  if (
+    typeof parsed.cwd !== 'string' ||
+    (expectedCwd !== undefined && path.resolve(parsed.cwd) !== path.resolve(expectedCwd))
+  ) {
     throw new SessionError(`Session "${id}" belongs to a different working directory.`);
   }
 
@@ -244,7 +251,7 @@ export async function loadSession(cwd: string, id: string): Promise<SessionRecor
   return {
     version: SESSION_VERSION,
     id,
-    cwd: path.resolve(cwd),
+    cwd: path.resolve(parsed.cwd),
     profile: typeof parsed.profile === 'string' ? parsed.profile : '',
     model: typeof parsed.model === 'string' ? parsed.model : '',
     title: typeof parsed.title === 'string' && parsed.title ? parsed.title : titleFromMessages(messages),
@@ -255,9 +262,24 @@ export async function loadSession(cwd: string, id: string): Promise<SessionRecor
   };
 }
 
+export async function loadSession(cwd: string, id: string): Promise<SessionRecord> {
+  const file = sessionFile(cwd, id);
+  let raw: string;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new SessionError(`Session "${id}" was not found for this directory.`);
+    }
+    throw new SessionError(`Could not read session "${id}": ${(error as Error).message}`);
+  }
+  return parseSessionRecord(raw, id, cwd);
+}
+
 function summarize(record: SessionRecord): SessionSummary {
   return {
     id: record.id,
+    cwd: record.cwd,
     profile: record.profile,
     model: record.model,
     title: record.title,
@@ -295,6 +317,84 @@ export async function listSessions(cwd: string, limit = 20): Promise<SessionList
 
   sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   return { sessions: sessions.slice(0, limit), skipped };
+}
+
+/** Reads one project directory straight from disk, for cross-directory listing. */
+async function summarizeProjectDir(dir: string, limit: number): Promise<SessionListResult> {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { sessions: [], skipped: 0 };
+    return { sessions: [], skipped: 1 };
+  }
+
+  const sessions: SessionSummary[] = [];
+  let skipped = 0;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const id = entry.name.slice(0, -'.json'.length);
+    if (!isSessionId(id)) {
+      skipped++;
+      continue;
+    }
+    try {
+      const raw = await readFile(path.join(dir, entry.name), 'utf8');
+      sessions.push(summarize(parseSessionRecord(raw, id)));
+    } catch {
+      skipped++;
+    }
+  }
+
+  sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return { sessions: sessions.slice(0, limit), skipped };
+}
+
+/**
+ * Lists sessions for `cwd` and every other directory found under the sessions
+ * root. Sessions are grouped by the cwd stored in each record, so a moved or
+ * copied project folder still lists under its recorded directory.
+ */
+export async function listAllSessions(cwd: string, limitPerDir = 20): Promise<AllSessionsResult> {
+  const root = sessionsRoot();
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { current: [], others: [], skipped: 0 };
+    }
+    throw new SessionError(`Could not list sessions: ${(error as Error).message}`);
+  }
+
+  const groups = new Map<string, SessionSummary[]>();
+  let skipped = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const result = await summarizeProjectDir(path.join(root, entry.name), limitPerDir);
+    skipped += result.skipped;
+    for (const session of result.sessions) {
+      const list = groups.get(session.cwd);
+      if (list) list.push(session);
+      else groups.set(session.cwd, [session]);
+    }
+  }
+
+  const resolved = path.resolve(cwd);
+  const byUpdated = (left: SessionSummary, right: SessionSummary): number =>
+    right.updatedAt.localeCompare(left.updatedAt);
+  const current = (groups.get(resolved) ?? []).sort(byUpdated).slice(0, limitPerDir);
+  groups.delete(resolved);
+  const others: SessionGroup[] = [...groups.entries()]
+    .filter(([, sessions]) => sessions.length > 0)
+    .map(([dirCwd, sessions]) => ({
+      cwd: dirCwd,
+      sessions: sessions.sort(byUpdated).slice(0, limitPerDir),
+    }))
+    .sort((left, right) =>
+      (right.sessions[0]?.updatedAt ?? '').localeCompare(left.sessions[0]?.updatedAt ?? ''),
+    );
+  return { current, others, skipped };
 }
 
 export async function latestSession(cwd: string): Promise<SessionRecord | null> {
