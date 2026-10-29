@@ -160,7 +160,7 @@ export function App({
   overrides,
   configPath,
   configCreated,
-  cwd,
+  cwd: initialCwd,
   version,
   yolo,
   mouseEnabled,
@@ -171,6 +171,8 @@ export function App({
   const { stdout } = useStdout();
   const { columns, rows } = useTerminalSize();
   const width = Math.max(20, columns - 2);
+  /** Changes when a session from another directory is resumed. */
+  const [cwd, setCwd] = useState(initialCwd);
 
   const initialViewRef = useRef<ReturnType<typeof buildResumedView> | null>(null);
   if (initialViewRef.current === null) {
@@ -1025,6 +1027,53 @@ export function App({
     addNotice('muted', 'No finished tool output to expand yet.');
   }, [addNotice, expandedToolId, items]);
 
+  /** Loads a session record into the UI, switching the working directory when needed. */
+  const applySessionRecord = useCallback(
+    async (record: SessionRecord): Promise<void> => {
+      await persistSession();
+      await saveChainRef.current;
+      const directory = path.resolve(record.cwd);
+      messagesRef.current = record.messages.filter((message) => message.role !== 'system');
+      usageRef.current = null;
+      const restoredUsage = record.usage ?? EMPTY_USAGE;
+      sessionUsageRef.current = restoredUsage;
+      setSessionUsage(restoredUsage);
+      setLastReply(null);
+      recomputeContext();
+      sessionRef.current = {
+        id: record.id,
+        createdAt: record.createdAt,
+        title: record.title,
+      };
+      const view = buildResumedView(messagesRef.current, {
+        cwd: directory,
+        version,
+        sessionId: record.id,
+      });
+      setItems(view.items);
+      nextItemIdRef.current = view.nextId;
+      setResetSignal((current) => current + 1);
+      setExpandedToolId(null);
+      resetAutoAllowed();
+      listedSessionsRef.current = null;
+      if (directory !== path.resolve(cwd)) {
+        setCwd(directory);
+        addNotice(
+          'info',
+          `Resumed session ${record.id} from ${shortCwd(directory, initialCwd)}. ` +
+            `Working directory is now ${shortCwd(directory, initialCwd)}.`,
+        );
+      }
+      if (record.profile && record.profile !== profileName) {
+        addNotice(
+          'muted',
+          `Session was saved with profile "${record.profile}"; staying on "${profileName}". Use /model ${record.profile} to switch.`,
+        );
+      }
+    },
+    [addNotice, cwd, initialCwd, persistSession, profileName, recomputeContext, resetAutoAllowed, version],
+  );
+
   const handleCommand = useCallback(
     async (input: string): Promise<void> => {
       if (busyRef.current || transitioningRef.current) return;
@@ -1331,6 +1380,26 @@ export function App({
                 target = matches[0];
               }
             }
+            if (!target && !numeric && isSessionId(argument)) {
+              // Search the other project directories before giving up.
+              const all = await listAllSessions(cwd, 20);
+              const candidates = all.others
+                .flatMap((group) => group.sessions)
+                .filter((session) => session.id === argument || session.id.startsWith(argument));
+              if (candidates.length > 1) {
+                addNotice('error', `Session id "${argument}" is ambiguous; use more characters.`);
+                return;
+              }
+              const foreign = candidates[0];
+              if (foreign) {
+                if (foreign.id === sessionRef.current?.id) {
+                  addNotice('info', `Session ${foreign.id} is already active.`);
+                  return;
+                }
+                await applySessionRecord(await loadSession(foreign.cwd, foreign.id));
+                return;
+              }
+            }
             if (!target && (numeric || !isSessionId(argument))) {
               addNotice('error', `No saved session matches "${argument}". Use /sessions to list them.`);
               return;
@@ -1341,37 +1410,7 @@ export function App({
               return;
             }
 
-            await persistSession();
-            await saveChainRef.current;
-            const record = await loadSession(cwd, targetId);
-            messagesRef.current = record.messages.filter((message) => message.role !== 'system');
-            usageRef.current = null;
-            const restoredUsage = record.usage ?? EMPTY_USAGE;
-            sessionUsageRef.current = restoredUsage;
-            setSessionUsage(restoredUsage);
-            setLastReply(null);
-            recomputeContext();
-            sessionRef.current = {
-              id: record.id,
-              createdAt: record.createdAt,
-              title: record.title,
-            };
-            const view = buildResumedView(messagesRef.current, {
-              cwd,
-              version,
-              sessionId: record.id,
-            });
-            setItems(view.items);
-            nextItemIdRef.current = view.nextId;
-            setResetSignal((current) => current + 1);
-            setExpandedToolId(null);
-            resetAutoAllowed();
-            if (record.profile && record.profile !== profileName) {
-              addNotice(
-                'muted',
-                `Session was saved with profile "${record.profile}"; staying on "${profileName}". Use /model ${record.profile} to switch.`,
-              );
-            }
+            await applySessionRecord(await loadSession(cwd, targetId));
           } catch (error) {
             addNotice('error', error instanceof Error ? error.message : String(error));
           } finally {
@@ -1535,6 +1574,7 @@ export function App({
     },
     [
       addNotice,
+      applySessionRecord,
       autoAllowed,
       cwd,
       listRemoteModels,
@@ -1555,17 +1595,23 @@ export function App({
     ],
   );
 
-  /** Resumes a picker selection only when it belongs to the current directory. */
+  /** Resumes a picker selection, switching directories when the session came from elsewhere. */
   const handleSessionPick = (session: SessionSummary): void => {
     setSessionPicker(null);
-    if (path.resolve(session.cwd) !== path.resolve(cwd)) {
-      addNotice(
-        'info',
-        `Session ${session.id} belongs to ${shortCwd(session.cwd, cwd)}. Start kiro in that directory to resume it.`,
-      );
+    if (session.id === sessionRef.current?.id) {
+      addNotice('info', `Session ${session.id} is already active.`);
       return;
     }
-    void handleCommand(`/resume ${session.id}`);
+    transitioningRef.current = true;
+    void (async () => {
+      try {
+        await applySessionRecord(await loadSession(session.cwd, session.id));
+      } catch (error) {
+        addNotice('error', error instanceof Error ? error.message : String(error));
+      } finally {
+        transitioningRef.current = false;
+      }
+    })();
   };
 
   /** Runs the next queued item once the app is idle, including queued slash commands. */
@@ -1635,7 +1681,6 @@ export function App({
         `Created config template at ${configPath}. Set your endpoint, model, and API key.`,
       );
     }
-    void loadPromptHistory(cwd).then(setPromptHistory);
     const active = config.profiles[config.activeProfile];
     if (active) {
       if (active.type !== 'openai') {
@@ -1657,6 +1702,11 @@ export function App({
     // Startup notices only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** History is per directory, so a resumed session reloads it. */
+  useEffect(() => {
+    void loadPromptHistory(cwd).then(setPromptHistory);
+  }, [cwd]);
 
   useEffect(() => {
     if (!stdout.isTTY) return;

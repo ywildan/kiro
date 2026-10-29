@@ -193,7 +193,7 @@ export function SessionPicker({
       ) : null}
       {scope === 'others' ? (
         <Text dimColor color={base} wrap="truncate-end">
-          Enter shows the directory to resume from.
+          Enter resumes and switches to that directory.
         </Text>
       ) : null}
       {range ? (

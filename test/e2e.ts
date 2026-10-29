@@ -88,6 +88,7 @@ import type {
 } from '../src/providers/types.js';
 import { ProviderError } from '../src/providers/types.js';
 import { childEnv, clearSecrets, redactSecrets, registerSecretEnv } from '../src/secrets.js';
+import { VERSION } from '../src/version.js';
 import { defaultExportPath, renderTranscriptMarkdown } from '../src/ui/export.js';
 import {
   dropIncompleteToolCalls,
@@ -1691,6 +1692,10 @@ async function main(): Promise<void> {
       assert.deepEqual(all.others[0]?.sessions.map((session) => session.id), [theirs.id]);
       assert.equal(all.skipped, 0);
 
+      const foreignRecord = await loadSession(other, theirs.id);
+      assert.equal(foreignRecord.cwd, path.resolve(other));
+      assert.equal(foreignRecord.messages[0]?.content, 'Theirs');
+
       await writeFile(path.join(projectSessionsDir(other), 'broken.json'), '{nope');
       const withBroken = await listAllSessions(workspace);
       assert.equal(withBroken.skipped, 1);
@@ -2498,6 +2503,13 @@ async function main(): Promise<void> {
     assert.equal(crowded.split('\n').length, 16);
     assert.match(crowded, /1-9 of 15/);
     assert.match(crowded, /↓ 6 more/);
+  });
+
+  await test('the reported version matches package.json', async () => {
+    const pkg = JSON.parse(
+      await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { version: string };
+    assert.equal(VERSION, pkg.version);
   });
 
   await test('middle truncation fits the budget and keeps both ends', async () => {
