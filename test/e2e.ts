@@ -122,6 +122,7 @@ import {
 } from '../src/ui/model-picker.js';
 import { ModelPicker } from '../src/ui/ModelPicker.js';
 import { SessionPicker } from '../src/ui/SessionPicker.js';
+import { AskUserPrompt } from '../src/ui/AskUserPrompt.js';
 import {
   SESSION_INLINE_ROWS,
   buildSessionRows,
@@ -171,8 +172,8 @@ import {
   type TextInputState,
 } from '../src/ui/text.js';
 import type { ViewItem } from '../src/ui/types.js';
-import { executeTool, isReadOnlyTool, MAX_TOOL_RESULT_CHARS } from '../src/tools/index.js';
-import type { ApprovalRequest, ToolContext } from '../src/tools/types.js';
+import { executeTool, isReadOnlyTool, MAX_TOOL_RESULT_CHARS, toolDefinitions } from '../src/tools/index.js';
+import type { ApprovalRequest, AskUserRequest, ToolContext } from '../src/tools/types.js';
 import { createMockServer, type MockServer, type MockTurn } from './mock-server.js';
 
 type ApproveResult = 'allow' | 'allow-session' | 'deny';
@@ -4405,6 +4406,120 @@ async function main(): Promise<void> {
     );
     assert.match(text, /\/model is a built-in, use \/skill model/);
     assert.ok(!text.includes('/anti-slop is a built-in'));
+  });
+
+  await test('ask_user returns the selection and needs an interactive terminal', async () => {
+    const cwd = await tempDir('kiro-ask-');
+    const base = () => ({ cwd, signal: new AbortController().signal });
+    try {
+      assert.ok(toolDefinitions.some((definition) => definition.function.name === 'ask_user'));
+      assert.equal(isReadOnlyTool('ask_user'), false, 'a question must not race other tools');
+
+      const requests: AskUserRequest[] = [];
+      const asked: ToolContext = {
+        ...base(),
+        approve: approvalSpy().fn,
+        askUser: async (request) => {
+          requests.push(request);
+          return { selected: ['Warm paper'], other: 'keep the serif', cancelled: false };
+        },
+      };
+      const result = await executeTool(
+        'ask_user',
+        JSON.stringify({
+          question: 'Which look?',
+          header: 'Design',
+          options: [
+            { label: 'Warm paper', description: 'Cream tones' },
+            { label: 'Cool slate' },
+          ],
+          multi_select: true,
+        }),
+        asked,
+      );
+      assert.equal(result.status, 'ok');
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0]?.header, 'Design');
+      assert.equal(requests[0]?.multiSelect, true);
+      assert.equal(requests[0]?.allowOther, true);
+      assert.match(result.content, /Which look\?/);
+      assert.match(result.content, /Selected: Warm paper/);
+      assert.match(result.content, /Other: keep the serif/);
+      assert.match(result.summary, /Warm paper/);
+
+      const headless = await executeTool(
+        'ask_user',
+        JSON.stringify({ question: 'Pick', options: [{ label: 'A' }] }),
+        { ...base(), approve: approvalSpy().fn },
+      );
+      assert.equal(headless.status, 'error');
+      assert.match(headless.content, /needs an interactive terminal/);
+
+      const cancelled = await executeTool(
+        'ask_user',
+        JSON.stringify({ question: 'Pick', options: [{ label: 'A' }] }),
+        {
+          ...base(),
+          approve: approvalSpy().fn,
+          askUser: async () => ({ selected: [], cancelled: true }),
+        },
+      );
+      assert.equal(cancelled.status, 'denied');
+      assert.match(cancelled.content, /dismissed the question/);
+
+      const invalid = await executeTool(
+        'ask_user',
+        JSON.stringify({ question: 'Pick', options: 'A' }),
+        asked,
+      );
+      assert.equal(invalid.status, 'error');
+      assert.match(invalid.content, /"options" must be an array/);
+
+      const tooMany = await executeTool(
+        'ask_user',
+        JSON.stringify({
+          question: 'Pick',
+          options: [1, 2, 3, 4, 5].map((n) => ({ label: `Option ${n}` })),
+        }),
+        asked,
+      );
+      assert.equal(tooMany.status, 'error');
+      assert.match(tooMany.content, /1 to 4 entries/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  await test('the question prompt renders a fixed frame with choices and Other', async () => {
+    const rendered = renderToString(
+      React.createElement(AskUserPrompt, {
+        request: {
+          question: 'Which design direction should I build?',
+          header: 'Design',
+          options: [
+            { label: 'Warm paper', description: 'Cream tones' },
+            { label: 'Cool slate', description: 'Blue gray' },
+          ],
+          multiSelect: true,
+          allowOther: true,
+        },
+        width: 76,
+        height: 16,
+        onAnswer: () => {},
+        onCancel: () => {},
+      }),
+      { columns: 120 },
+    ).trimEnd();
+    const lines = rendered.split('\n');
+    assert.equal(lines.length, 16, 'the question dialog keeps a fixed frame');
+    const text = lines.join('\n');
+    assert.match(text, /\? Design/);
+    assert.match(text, /Which design direction/);
+    assert.match(text, /\[ \] 1\. Warm paper/);
+    assert.match(text, /3\. Other:/);
+    assert.match(text, /Space/);
+    assert.match(text, /Esc/);
+    assert.ok(lines.every((line) => displayWidth(line) <= 76), 'every line fits the frame');
   });
 
   await test('doctor reports config, key, and endpoint problems', async () => {

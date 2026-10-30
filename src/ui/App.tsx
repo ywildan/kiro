@@ -53,8 +53,15 @@ import {
   type SessionRecord,
   type SessionSummary,
 } from '../sessions.js';
-import type { ApprovalDecision, ApprovalRequest, ToolContext } from '../tools/types.js';
+import type {
+  ApprovalDecision,
+  ApprovalRequest,
+  AskUserAnswer,
+  AskUserRequest,
+  ToolContext,
+} from '../tools/types.js';
 import { ApprovalPrompt } from './ApprovalPrompt.js';
+import { AskUserPrompt } from './AskUserPrompt.js';
 import { ApprovalPolicy } from './approval-policy.js';
 import {
   builtinCommandNames,
@@ -100,6 +107,8 @@ import {
 
 /** Idle Ctrl+C must be pressed again within this window to exit. */
 const QUIT_CONFIRM_MS = 2_000;
+/** Tallest inline question block: title, three question lines, four options, other, footer, borders. */
+const ASK_INLINE_ROWS = 12;
 
 export interface StartupNotice {
   level: 'info' | 'error' | 'muted';
@@ -202,6 +211,7 @@ export function App({
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
+  const [pendingQuestion, setPendingQuestion] = useState<AskUserRequest | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [sessionPicker, setSessionPicker] = useState<AllSessionsResult | null>(null);
   const [quitArmed, setQuitArmed] = useState(false);
@@ -271,6 +281,8 @@ export function App({
   const [autoAllowed, setAutoAllowed] = useState<string[]>([]);
   const pendingApprovalRef = useRef<ApprovalRequest | null>(null);
   const pendingResolverRef = useRef<((decision: ApprovalDecision) => void) | null>(null);
+  const pendingQuestionRef = useRef<AskUserRequest | null>(null);
+  const questionResolverRef = useRef<((answer: AskUserAnswer) => void) | null>(null);
 
   const textBufferRef = useRef('');
   const queuedRef = useRef<string[]>([]);
@@ -666,6 +678,33 @@ export function App({
     [approvalPolicy],
   );
 
+  const resolveQuestion = useCallback((answer: AskUserAnswer): void => {
+    const resolver = questionResolverRef.current;
+    pendingQuestionRef.current = null;
+    questionResolverRef.current = null;
+    setPendingQuestion(null);
+    resolver?.(answer);
+  }, []);
+
+  const askUser = useCallback(
+    (request: AskUserRequest): Promise<AskUserAnswer> => {
+      const signal = abortRef.current?.signal;
+      if (signal?.aborted) return Promise.resolve({ selected: [], cancelled: true });
+      return new Promise<AskUserAnswer>((resolve) => {
+        // Cancelling the turn must release the tool, even if Ctrl+C skipped the prompt.
+        const onAbort = (): void => resolveQuestion({ selected: [], cancelled: true });
+        signal?.addEventListener('abort', onAbort, { once: true });
+        pendingQuestionRef.current = request;
+        questionResolverRef.current = (answer) => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve(answer);
+        };
+        setPendingQuestion(request);
+      });
+    },
+    [resolveQuestion],
+  );
+
   const resetAutoAllowed = useCallback((): void => {
     approvalPolicy.clear();
     setAutoAllowed([]);
@@ -756,6 +795,7 @@ export function App({
           cwd,
           signal: controller.signal,
           approve,
+          askUser,
         };
 
         for await (const event of runAgentTurn({
@@ -902,6 +942,7 @@ export function App({
         setActiveTool(null);
         setCancelling(false);
         if (pendingApprovalRef.current) resolveApproval('deny');
+        if (pendingQuestionRef.current) resolveQuestion({ selected: [], cancelled: true });
         recomputeContext();
         void persistSession();
         void refreshSkillCommands();
@@ -919,6 +960,7 @@ export function App({
     [
       addNotice,
       approve,
+      askUser,
       autoCompact,
       cwd,
       finalizeAssistant,
@@ -930,6 +972,7 @@ export function App({
       queueText,
       recomputeContext,
       resolveApproval,
+      resolveQuestion,
     ],
   );
 
@@ -1718,7 +1761,14 @@ export function App({
 
   useInput((input, key) => {
     if (key.ctrl && input === 'o') {
-      if (wizardActiveRef.current || wizardPromptRef.current || pendingApprovalRef.current) return;
+      if (
+        wizardActiveRef.current ||
+        wizardPromptRef.current ||
+        pendingApprovalRef.current ||
+        pendingQuestionRef.current
+      ) {
+        return;
+      }
       if (pickerOpen || sessionPicker !== null) return;
       expandLastToolOutput();
       return;
@@ -1739,11 +1789,12 @@ export function App({
       cancelWizard();
       return;
     }
-    if (pendingApprovalRef.current) {
+    if (pendingApprovalRef.current || pendingQuestionRef.current) {
       disarmQuit();
       cancelRequestedRef.current = true;
       setCancelling(true);
       resolveApproval('deny');
+      resolveQuestion({ selected: [], cancelled: true });
       abortRef.current?.abort();
       return;
     }
@@ -1765,19 +1816,24 @@ export function App({
     armQuit();
   });
 
-  const activity: Activity = pendingApproval
-    ? 'approval'
-    : cancelling
-      ? 'cancelling'
-      : busy
-        ? activeTool
-          ? 'running'
-          : replying
-            ? 'replying'
-            : 'thinking'
-        : null;
+  const activity: Activity = pendingQuestion
+    ? 'question'
+    : pendingApproval
+      ? 'approval'
+      : cancelling
+        ? 'cancelling'
+        : busy
+          ? activeTool
+            ? 'running'
+            : replying
+              ? 'replying'
+              : 'thinking'
+          : null;
   const activeProfile = runtimeConfig.profiles[profileName];
   const contextWindow = contextWindowFor(activeProfile);
+  const questionPopup =
+    pendingQuestion !== null && !pendingApproval ? pickerPopupRect(columns, rows) : null;
+  const questionInline = pendingQuestion !== null && !pendingApproval && questionPopup === null;
   const pickerPopup =
     (pickerOpen || sessionPicker !== null) && !pendingApproval
       ? pickerPopupRect(columns, rows)
@@ -1786,13 +1842,16 @@ export function App({
   const sessionInline =
     sessionPicker !== null && !pendingApproval && pickerPopup === null && !pickerOpen;
   const extraInputRows =
-    pendingApproval || pickerInline || sessionInline ? 0 : Math.max(0, inputRows - 1);
+    pendingApproval || questionInline || pickerInline || sessionInline
+      ? 0
+      : Math.max(0, inputRows - 1);
   const viewportHeight = Math.max(
     3,
     rows -
       5 -
       extraInputRows -
       (pendingApproval ? 12 : 0) -
+      (questionInline ? ASK_INLINE_ROWS : 0) -
       (pickerInline ? PICKER_INLINE_ROWS : 0) -
       (sessionInline ? SESSION_INLINE_ROWS : 0),
   );
@@ -1810,7 +1869,12 @@ export function App({
           expandedToolId={expandedToolId}
           palette={palette}
           interactive={
-            !pendingApproval && !pickerOpen && sessionPicker === null && !wizardActive && wizardPrompt === null
+            !pendingApproval &&
+            pendingQuestion === null &&
+            !pickerOpen &&
+            sessionPicker === null &&
+            !wizardActive &&
+            wizardPrompt === null
           }
         />
         {showUsageCard ? (
@@ -1831,6 +1895,13 @@ export function App({
           request={pendingApproval}
           width={width}
           onDecision={resolveApproval}
+        />
+      ) : questionInline && pendingQuestion ? (
+        <AskUserPrompt
+          request={pendingQuestion}
+          width={width}
+          onAnswer={resolveQuestion}
+          onCancel={() => resolveQuestion({ selected: [], cancelled: true })}
         />
       ) : pickerInline ? (
         <ModelPicker
@@ -1853,7 +1924,7 @@ export function App({
       ) : (
         <Input
           key={wizardPrompt?.id ?? 0}
-          disabled={pickerOpen || sessionPicker !== null}
+          disabled={pickerOpen || sessionPicker !== null || pendingQuestion !== null}
           width={width}
           mask={wizardPrompt?.mask}
           allowEmpty={wizardPrompt?.allowEmpty}
@@ -1869,7 +1940,9 @@ export function App({
               ? 'Model picker open · Esc to close'
               : sessionPicker
                 ? 'Session picker open · Esc to close'
-                : wizardPrompt
+                : pendingQuestion
+                  ? 'Answer the question above · Esc to cancel'
+                  : wizardPrompt
                 ? wizardPrompt.defaultValue && !wizardPrompt.mask
                   ? `${wizardPrompt.label} [${wizardPrompt.defaultValue}]`
                   : wizardPrompt.label
@@ -1899,7 +1972,17 @@ export function App({
         contextTokens={showUsageCard ? undefined : contextTokens}
         contextWindow={showUsageCard ? undefined : contextWindow}
       />
-      {pickerOpen && pickerPopup ? (
+      {pendingQuestion && questionPopup ? (
+        <Box position="absolute" marginTop={questionPopup.top} marginLeft={questionPopup.left}>
+          <AskUserPrompt
+            request={pendingQuestion}
+            width={questionPopup.width}
+            height={questionPopup.height}
+            onAnswer={resolveQuestion}
+            onCancel={() => resolveQuestion({ selected: [], cancelled: true })}
+          />
+        </Box>
+      ) : pickerOpen && pickerPopup ? (
         <Box position="absolute" marginTop={pickerPopup.top} marginLeft={pickerPopup.left}>
           <ModelPicker
             config={runtimeConfig}

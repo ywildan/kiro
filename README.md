@@ -397,8 +397,11 @@ Compaction shows a notice and is written to the session, so a resumed conversati
 | `multi_edit(path, edits[])` | Several exact replacements in one file, validated together and written once | always (except `--yolo`) |
 | `apply_patch(patch)` | Applies a unified diff to one or more files after validating every hunk | always (except `--yolo`) |
 | `run_command(command, timeout_seconds?)` | Runs a shell command in the working directory | always (except `--yolo`) |
+| `ask_user(question, options, header?, multi_select?, allow_other?)` | Asks the user to pick from 1 to 4 short options and waits for the answer. `Other` accepts typed text | never |
 
 `grep` and `glob` keep large repositories manageable, and `read_file` pages through long files. Use `multi_edit` for several changes in one file and `apply_patch` for coordinated changes across files; `apply_patch` validates the whole patch before writing and rejects deletions and renames.
+
+`ask_user` shows a centered prompt when the model needs a decision that belongs to you, such as a design direction or a choice between conflicting requirements. Use `↑/↓` to move, `Enter` to choose, `Space` to toggle when several answers are allowed, and `Esc` to dismiss. Dismissing returns a refusal to the model and the turn continues. Headless runs have no terminal, so the tool returns an error and the model is told to ask in plain text instead.
 
 Approvals show a diff, or the exact command, and offer:
 

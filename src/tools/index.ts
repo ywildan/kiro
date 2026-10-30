@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../providers/types.js';
 import { redactSecrets } from '../secrets.js';
+import { askTools } from './ask.js';
 import { fsTools } from './fs.js';
 import { patchTools } from './patch.js';
 import { searchTools } from './search.js';
@@ -10,7 +11,14 @@ import { toolError } from './types.js';
 
 export const MAX_TOOL_RESULT_CHARS = 60_000;
 
-export const tools: Tool[] = [...fsTools, ...searchTools, ...patchTools, runCommandTool, ...skillTools];
+export const tools: Tool[] = [
+  ...fsTools,
+  ...searchTools,
+  ...patchTools,
+  runCommandTool,
+  ...askTools,
+  ...skillTools,
+];
 
 export const toolDefinitions: ToolDefinition[] = tools.map((tool) => tool.definition);
 

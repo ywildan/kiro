@@ -51,10 +51,11 @@ export async function buildSystemPrompt(cwd: string): Promise<string> {
     '- Tool output may be truncated. Use read_file offsets, narrower grep patterns/globs, or smaller result limits if you need more detail.',
     '- If a tool returns an error, read it carefully and adjust; edit_file/multi_edit errors include a hint about the closest line or whitespace mismatch.',
     '- The user must approve write_file, edit_file, multi_edit, apply_patch, and run_command. If they deny a call, respect the decision and explain alternatives instead of retrying the same action.',
+    '- Use ask_user when a choice belongs to the user: design direction, mutually exclusive options, or a requirement only they can settle. Ask once with short labels and wait; do not print numbered questions as text. Do not use it to ask permission for a tool call.',
     '- Do not invent file contents or command output. Keep final answers concise: say what changed and include relevant verification results.',
     '- A turn is limited to 25 tool-call rounds. Keep work focused and finish when the task is done.',
     '',
-    'You have these tools: read_file, write_file, edit_file, multi_edit, apply_patch, list_dir, glob, grep, run_command.',
+    'You have these tools: read_file, write_file, edit_file, multi_edit, apply_patch, list_dir, glob, grep, run_command, ask_user.',
   ].join('\n');
 
   const [agents, inventory] = await Promise.all([readAgentsSection(cwd), loadSkills(cwd)]);

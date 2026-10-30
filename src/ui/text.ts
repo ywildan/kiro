@@ -503,6 +503,8 @@ export function summarizeToolArgs(name: string, rawArguments: string): string {
       const command = typeof args.command === 'string' ? args.command : '';
       return `$ ${sanitizeInput(command)}`;
     }
+    case 'ask_user':
+      return typeof args.question === 'string' ? args.question : '?';
     default:
       return truncateToWidth(sanitizeInput(rawArguments), 80);
   }

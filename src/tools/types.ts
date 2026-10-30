@@ -13,10 +13,38 @@ export interface ApprovalRequest {
 
 export type ApproveFn = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
+export interface AskUserOption {
+  label: string;
+  description?: string;
+}
+
+export interface AskUserRequest {
+  /** The question, one or two sentences. */
+  question: string;
+  /** Short title for the prompt, e.g. "Design". */
+  header?: string;
+  options: AskUserOption[];
+  multiSelect: boolean;
+  /** Offer a free-form answer in addition to the listed options. */
+  allowOther: boolean;
+}
+
+export interface AskUserAnswer {
+  /** Labels the user picked, in option order. */
+  selected: string[];
+  /** Text typed under "Other"; empty when only listed options were picked. */
+  other?: string;
+  cancelled: boolean;
+}
+
+export type AskUserFn = (request: AskUserRequest) => Promise<AskUserAnswer>;
+
 export interface ToolContext {
   cwd: string;
   signal: AbortSignal;
   approve: ApproveFn;
+  /** Undefined outside the TUI: headless runs cannot answer questions. */
+  askUser?: AskUserFn;
 }
 
 export type ToolStatus = 'ok' | 'error' | 'denied';

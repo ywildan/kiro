@@ -6,7 +6,14 @@ import { displayWidth, truncateMiddle, truncateToWidth } from './text.js';
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-export type Activity = 'thinking' | 'replying' | 'running' | 'cancelling' | 'approval' | null;
+export type Activity =
+  | 'thinking'
+  | 'replying'
+  | 'running'
+  | 'cancelling'
+  | 'approval'
+  | 'question'
+  | null;
 
 interface StatusBarProps {
   width: number;
@@ -64,15 +71,17 @@ export function StatusBar({
     ? 'Ctrl+C again to quit'
     : activity === 'approval'
       ? 'approval needed'
-      : activity === 'cancelling'
-        ? 'cancelling…'
-        : activity === 'running'
-          ? `running ${toolName ?? 'tool'}…`
-          : activity === 'replying'
-            ? 'replying…'
-            : activity === 'thinking'
-              ? 'thinking…'
-              : 'ready';
+      : activity === 'question'
+        ? 'answer needed'
+        : activity === 'cancelling'
+          ? 'cancelling…'
+          : activity === 'running'
+            ? `running ${toolName ?? 'tool'}…`
+            : activity === 'replying'
+              ? 'replying…'
+              : activity === 'thinking'
+                ? 'thinking…'
+                : 'ready';
   const stateColor = quitHint
     ? 'red'
     : activity === 'cancelling'
