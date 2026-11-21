@@ -48,7 +48,7 @@ export async function connectStdio(
     write: (line) => {
       if (child.stdin?.writable) child.stdin.write(line);
     },
-    timeoutMs: MCP_CALL_TIMEOUT_MS,
+    timeoutMs: config.timeoutMs ?? MCP_CALL_TIMEOUT_MS,
     onNotice: (message) => {
       notices.push(message);
       options.onNotice?.(`${name}: ${message}`);
@@ -106,7 +106,8 @@ export async function connectStdio(
       name: typeof info.name === 'string' ? info.name : name,
       version: typeof info.version === 'string' ? info.version : 'unknown',
     },
-    (method, params) => rpc.request(method, params),
+    (method, params, signal) =>
+      rpc.request(method, params, method === 'tools/call' ? config.timeoutMs : undefined, signal),
     async () => {
       rpc.close();
       child.stdin?.end();

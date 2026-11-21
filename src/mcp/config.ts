@@ -23,6 +23,11 @@ export interface McpServerEntry {
   /** http: the streamable-HTTP endpoint. */
   url?: string;
   headers?: Record<string, string>;
+  /**
+   * Per-call limit in milliseconds, for stdio and HTTP alike. A tool that
+   * blocks, such as a long-poll `wait_for_message`, needs a large value.
+   */
+  timeoutMs?: number;
   /** Server-wide switch; a disabled server is listed by /mcp but never started. */
   disabled?: boolean;
 }
@@ -93,6 +98,15 @@ function stringMap(raw: unknown): Record<string, string> | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** `timeout` is milliseconds, matching other MCP clients; `timeoutSec` is the same in seconds. */
+function timeoutMsFrom(raw: Record<string, unknown>): number | undefined {
+  const ms = typeof raw.timeout === 'number' ? raw.timeout : undefined;
+  const sec = typeof raw.timeoutSec === 'number' ? raw.timeoutSec * 1000 : undefined;
+  const value = ms ?? sec;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
+  return Math.min(value, 24 * 60 * 60 * 1000);
+}
+
 function normalizeEntry(raw: Record<string, unknown>): McpServerEntry {
   const args = Array.isArray(raw.args) ? raw.args.filter((arg): arg is string => typeof arg === 'string') : undefined;
   return {
@@ -107,6 +121,7 @@ function normalizeEntry(raw: Record<string, unknown>): McpServerEntry {
     env: stringMap(raw.env),
     url: typeof raw.url === 'string' ? raw.url : undefined,
     headers: stringMap(raw.headers),
+    timeoutMs: timeoutMsFrom(raw),
     disabled: raw.disabled === true,
   };
 }
@@ -139,7 +154,7 @@ export async function loadMcpConfig(
 /** Why a server cannot be started, or null when it can. */
 export function mcpEntryProblem(entry: McpServerEntry): string | null {
   if (entry.disabled) return 'disabled in the config';
-  if (entry.type === 'http') return 'HTTP servers are not started by this build yet';
+  if (entry.type === 'http') return entry.url ? null : 'no "url" was given';
   if (!entry.command) return 'no "command" was given';
   return null;
 }

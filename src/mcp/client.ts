@@ -28,13 +28,15 @@ export interface McpCallResult {
 
 export interface McpEndpoint {
   serverName: string;
-  /** 'sdk' when the official client is in use, 'builtin' for the fallback. */
-  transport: 'sdk' | 'builtin';
+  /** 'sdk' for the official client, 'builtin' for the stdio fallback, 'http' for streamable HTTP. */
+  transport: 'sdk' | 'builtin' | 'http';
   serverInfo: { name: string; version: string };
   listTools(): Promise<McpToolInfo[]>;
-  callTool(name: string, args: Record<string, unknown>): Promise<McpCallResult>;
+  /** `signal` aborts a call that blocks, so Ctrl+C works on a long-poll tool. */
+  callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpCallResult>;
   close(): Promise<void>;
 }
+
 
 export interface McpServerConfig {
   command: string;
@@ -42,6 +44,15 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   /** Working directory for the server process; defaults to the project. */
   cwd?: string;
+  /** Per-server limit for one `tools/call`; a blocking tool needs a long one. */
+  timeoutMs?: number;
+}
+
+export interface McpHttpConfig {
+  url: string;
+  headers?: Record<string, string>;
+  /** Per-call limit for one request; a blocking tool needs a long one. */
+  timeoutMs?: number;
 }
 
 /**
@@ -114,7 +125,7 @@ export function endpointFrom(
   serverName: string,
   transport: McpEndpoint['transport'],
   serverInfo: { name: string; version: string },
-  call: (method: string, params?: unknown) => Promise<unknown>,
+  call: (method: string, params?: unknown, signal?: AbortSignal) => Promise<unknown>,
   close: () => Promise<void> | void,
 ): McpEndpoint {
   return {
@@ -125,8 +136,9 @@ export function endpointFrom(
       const result = await call('tools/list', {});
       return readToolList(result);
     },
-    async callTool(name, args) {
-      const result = await call('tools/call', { name, arguments: args });
+    async callTool(name, args, signal) {
+      if (signal?.aborted) throw new Error('The tool call was cancelled.');
+      const result = await call('tools/call', { name, arguments: args }, signal);
       const record = typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : {};
       return {
         content: flattenContent(record.content),

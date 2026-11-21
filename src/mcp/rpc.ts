@@ -36,6 +36,9 @@ interface Pending {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  /** Aborts this one call, e.g. when the user cancels a blocking tool. */
+  onAbort?: () => void;
+  signal?: AbortSignal;
 }
 
 interface RpcChannelOptions {
@@ -68,20 +71,46 @@ export class RpcChannel {
     this.handlers.set(method, handler);
   }
 
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  /**
+   * `timeoutMs` overrides the channel default for one call, e.g. a blocking
+   * tool. `signal` drops the call without waiting for the timeout; the server
+   * still finishes on its side, so only use it when the answer is no longer
+   * wanted.
+   */
+  request<T = unknown>(method: string, params?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
     if (this.closed) return Promise.reject(new Error('The MCP connection is closed.'));
+    if (signal?.aborted) return Promise.reject(new Error(`${method} was cancelled.`));
     const id = this.nextId++;
+    const limit = timeoutMs ?? this.timeoutMs;
     return new Promise<T>((resolve, reject) => {
+      const finish = (error?: Error, value?: unknown): void => {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        this.pending.delete(id);
+        clearTimeout(entry.timer);
+        if (entry.signal) entry.signal.removeEventListener('abort', entry.onAbort!);
+        if (error) reject(error);
+        else resolve(value as T);
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new RpcTimeoutError(method, this.timeoutMs));
-      }, this.timeoutMs);
+        if (signal) signal.removeEventListener('abort', onAbort);
+        reject(new RpcTimeoutError(method, limit));
+      }, limit);
       timer.unref?.();
+      const onAbort = (): void => {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(new Error(`${method} was cancelled.`));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {
         method,
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
+        onAbort,
+        signal,
       });
       this.send({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) });
     });
@@ -115,6 +144,7 @@ export class RpcChannel {
     this.closed = true;
     for (const [id, pending] of this.pending) {
       clearTimeout(pending.timer);
+      if (pending.signal) pending.signal.removeEventListener('abort', pending.onAbort!);
       pending.reject(new Error(`The connection closed before ${pending.method} answered.`));
       this.pending.delete(id);
     }

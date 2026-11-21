@@ -567,7 +567,38 @@ The project file wins when both define the same name. The shape matches the file
 }
 ```
 
-Only `stdio` servers are started. A server entry with a `url` (streamable HTTP) and an entry marked `disabled` are listed by `/mcp` and reported at startup, but Kiro does not connect to them. Set `KIRO_MCP_CONFIG` to load a different file instead of the two defaults.
+Both transports work. An entry with a `url` (or `"type": "http"`) is called over streamable HTTP: one POST per message, the reply as JSON or as an SSE stream, and the `Mcp-Session-Id` header repeated after the handshake. An entry with a `command` is started as a child process and spoken to over stdio. Entries marked `"disabled"` are listed by `/mcp` and skipped. Set `KIRO_MCP_CONFIG` to load a different file instead of the two defaults.
+
+A remote server usually needs a token. Put it in `headers` and point at the environment so the file stays free of secrets:
+
+```json
+{
+  "mcpServers": {
+    "agentrelay": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${AGENTRELAY_TOKEN}" },
+      "timeout": 3600000
+    }
+  }
+}
+```
+
+`timeout` is milliseconds and raises the limit for one `tools/call` on that server; `KIRO_MCP_TIMEOUT_MS` (default 30000) is the global value. Raise it for a tool that blocks, such as a long-poll `wait_for_message`; a per-server `timeout` wins. Ctrl+C still cancels such a call, because the request is aborted rather than waited out.
+
+The same server can be reached through a stdio shim instead, which is useful when the remote side needs a reconnect:
+
+```json
+{
+  "mcpServers": {
+    "agentrelay": {
+      "command": "npx",
+      "args": ["-y", "agentrelay-mcp", "--url", "https://mcp.example.com/mcp", "--token", "${AGENTRELAY_TOKEN}"],
+      "timeout": 3600000
+    }
+  }
+}
+```
 
 Server names and tool names become one tool name, `mcp__<server>__<tool>`, so two servers can offer the same tool. `/mcp` prints every server with its state, its tool count, and where the config came from.
 
@@ -577,7 +608,8 @@ A few rules keep MCP predictable:
 - A server that fails to start is reported once and skipped. The rest of the session runs normally, and a server that prints non-JSON lines (a banner, a log line) produces a notice instead of an error.
 - The server inherits the environment Kiro runs with, minus stored credentials, plus any `env` in its entry. `${VAR}` inside a value is expanded from the environment.
 - Tool output is flattened to text: text and resource contents are kept, and image or audio blocks become a placeholder.
-- `--no-mcp` (or `KIRO_NO_MCP=1`) starts nothing. `KIRO_MCP_CONNECT_MS` sets the handshake timeout (default 15000) and `KIRO_MCP_TIMEOUT_MS` the timeout for a `tools/call` (default 30000).
+- `--no-mcp` (or `KIRO_NO_MCP=1`) starts nothing. `KIRO_MCP_CONNECT_MS` sets the handshake timeout (default 15000) and `KIRO_MCP_TIMEOUT_MS` the timeout for a `tools/call` (default 30000), which a server's own `timeout` overrides.
+- A 401 or 403 on an HTTP server names the status and points at `headers`, instead of failing silently. An unreachable URL becomes an `error` status and the session continues.
 
 MCP tools are always treated as unsafe: no parallel batch, always an approval prompt. The protocol is JSON-RPC 2.0 over stdio, one JSON object per line.
 
@@ -621,7 +653,7 @@ test/
 - `@` lists files only and stops at 50,000 paths; directories and ignored files are not offered.
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
 - No sub-agents, plugins, web search, image input, themes, or git integration.
-- MCP support covers `stdio` servers only. Streamable-HTTP servers are read from the config file and reported as skipped.
+- The HTTP transport has no SSE reconnect and no server-to-client requests: a server that pushes a request over HTTP gets a notice, not an answer.
 - The live output line shows the newest line only, capped at 400 characters; earlier lines arrive with the tool result.
 - Approval rules match a glob, not a shell grammar: a rule for `npm test*` also covers `npm test-evil`. Review saved rules with `/rules` when a project's rules come from someone else.
 - The cost estimate uses a built-in list-price table that ages; `/context` names the price it used, and `pricing` in the profile overrides it.

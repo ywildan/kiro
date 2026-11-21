@@ -9,6 +9,7 @@ import {
 } from './client.js';
 import { loadMcpConfig, mcpEntryProblem, type McpLoadResult, type McpServerEntry } from './config.js';
 import { connectStdio } from './stdio.js';
+import { connectHttp } from './http.js';
 
 /**
  * Turns a server's tools into Kiro tools, namespaced as `mcp__<server>__<tool>`.
@@ -23,7 +24,7 @@ export const MCP_CONNECT_TIMEOUT_MS = Number(process.env.KIRO_MCP_CONNECT_MS ?? 
 export interface McpServerStatus {
   name: string;
   state: 'ready' | 'error' | 'skipped';
-  transport?: 'sdk' | 'builtin';
+  transport?: 'sdk' | 'builtin' | 'http';
   detail?: string;
   tools: number;
   /** The config entry, so `/mcp` can show the command without re-reading the file. */
@@ -106,7 +107,7 @@ function mcpTool(server: string, endpoint: McpEndpoint, info: McpToolInfo): Tool
         return { content: 'User denied this MCP tool call.', summary: 'denied by user', status: 'denied' };
       }
       try {
-        const result = await endpoint.callTool(info.name, input);
+        const result = await endpoint.callTool(info.name, input, ctx.signal);
         const content = result.content || '(no content)';
         return {
           content: result.isError ? `Error: ${content}` : content,
@@ -114,6 +115,9 @@ function mcpTool(server: string, endpoint: McpEndpoint, info: McpToolInfo): Tool
           status: result.isError ? 'error' : 'ok',
         };
       } catch (error) {
+        if (ctx.signal.aborted) {
+          return { content: 'Cancelled by user.', summary: 'cancelled', status: 'denied' };
+        }
         return {
           content: `Error: MCP server "${server}" failed to run "${info.name}": ${(error as Error).message}`,
           summary: `${info.name} failed`,
@@ -168,10 +172,15 @@ export async function setupMcp(
       }
       try {
         const endpoint = await withTimeout(
-          connectStdio(name, { command: entry.command!, args: entry.args, env: entry.env }, {
-            cwd,
-            onNotice: options.onNotice,
-          }),
+          entry.type === 'http'
+            ? connectHttp(name, { url: entry.url!, headers: entry.headers, timeoutMs: entry.timeoutMs }, {
+                onNotice: options.onNotice,
+              })
+            : connectStdio(
+                name,
+                { command: entry.command!, args: entry.args, env: entry.env, timeoutMs: entry.timeoutMs },
+                { cwd, onNotice: options.onNotice },
+              ),
           MCP_CONNECT_TIMEOUT_MS,
           `Starting MCP server "${name}"`,
         );
@@ -225,9 +234,13 @@ export function formatMcpStatus(setup: McpSetup | null, extraDir?: string): stri
     const command = status.entry?.command
       ? `${status.entry.command} ${(status.entry.args ?? []).join(' ')}`.trim()
       : status.entry?.url ?? '';
+    const limit = status.entry?.timeoutMs
+      ? `      timeout ${Math.round(status.entry.timeoutMs / 1000)}s`
+      : '';
     return [
       `${mark}  ${status.name}${status.tools > 0 ? ` (${status.tools} tool${status.tools === 1 ? '' : 's'})` : ''}`,
       command ? `      ${command}` : '',
+      limit,
       status.detail ? `      ${status.detail}` : '',
     ]
       .filter(Boolean)

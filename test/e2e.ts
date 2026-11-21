@@ -76,6 +76,7 @@ import { flattenContent, mcpToolName, readToolList } from '../src/mcp/client.js'
 import { loadMcpConfig, mcpEntryProblem, readMcpFile } from '../src/mcp/config.js';
 import { formatMcpStatus, isMcpTool, mcpNeedsApproval, setupMcp } from '../src/mcp/registry.js';
 import { connectStdio } from '../src/mcp/stdio.js';
+import { connectHttp, readSseMessage } from '../src/mcp/http.js';
 import { setExtraTools, allToolDefinitions, allTools } from '../src/tools/index.js';
 import { chatEndpoint, endpointUrl, profileHeaders, requestHeaders } from '../src/providers/request.js';
 import { ApprovalPrompt } from '../src/ui/ApprovalPrompt.js';
@@ -2431,8 +2432,8 @@ async function main(): Promise<void> {
     assert.equal(flattenContent('plain string'), 'plain string');
     assert.equal(flattenContent(undefined), '');
 
-    const entry = { type: 'http' as const, url: 'https://example.com/mcp' };
-    assert.match(mcpEntryProblem(entry) ?? '', /HTTP servers/);
+    assert.equal(mcpEntryProblem({ type: 'http', url: 'https://example.com/mcp' }), null);
+    assert.match(mcpEntryProblem({ type: 'http' }) ?? '', /url/);
     assert.match(mcpEntryProblem({ disabled: true }) ?? '', /disabled/);
     assert.match(mcpEntryProblem({ command: '' }) ?? '', /command/);
     assert.equal(mcpEntryProblem({ command: 'node' }), null);
@@ -2471,6 +2472,8 @@ async function main(): Promise<void> {
       assert.equal(loaded.servers.shared?.command, 'project-command', 'the project file wins');
       assert.equal(loaded.servers.shared?.disabled, true);
       assert.equal(loaded.servers.remote?.type, 'http');
+      assert.deepEqual(loaded.servers.remote?.headers, { 'x-key': 'k' });
+      assert.equal(loaded.servers.remote?.timeoutMs, undefined, 'no timeout means the default');
       assert.deepEqual(loaded.servers.onlyUser?.args, ['x.js']);
       assert.equal(loaded.problems.length, 0);
       assert.equal(loaded.sources.length, 2);
@@ -2505,7 +2508,7 @@ async function main(): Promise<void> {
             demo: { command: process.execPath, args: [tsx, serverPath] },
             broken: { command: path.join(dir, 'does-not-exist') },
             off: { command: 'node', disabled: true },
-            web: { url: 'https://example.com/mcp' },
+            web: { type: 'http' },
           },
         }),
         'utf8',
@@ -2613,6 +2616,167 @@ async function main(): Promise<void> {
       );
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+
+  await test('MCP streamable HTTP connects, lists tools over SSE, and honours the token and timeout', async () => {
+    const port = 8900 + Math.floor(Math.random() * 90);
+    const server = spawn(
+      process.execPath,
+      [path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'), path.join(process.cwd(), 'test', 'mcp-http-server.ts'), String(port)],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } },
+    );
+    const ready = new Promise<void>((resolve, reject) => {
+      let seen = '';
+      const timer = setTimeout(() => reject(new Error('the fixture server did not start')), 20_000);
+      server.stdout?.setEncoding('utf8');
+      server.stdout?.on('data', (chunk: string) => {
+        seen += chunk;
+        if (/listening/.test(seen)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      server.on('error', reject);
+    });
+    const url = `http://127.0.0.1:${port}/mcp`;
+    try {
+      await ready;
+      const endpoint = await connectHttp('demo', { url, headers: { Authorization: 'Bearer test-token' } });
+      try {
+        assert.equal(endpoint.transport, 'http');
+        assert.equal(endpoint.serverInfo.name, 'kiro-http-server');
+        const tools = await endpoint.listTools();
+        assert.deepEqual(tools.map((tool) => tool.name), ['http_echo', 'http_slow']);
+        assert.equal(tools[0]?.annotations?.readOnlyHint, true);
+        assert.deepEqual(await endpoint.callTool('http_echo', { text: 'hi' }), { content: 'echo: hi', isError: false });
+      } finally {
+        await endpoint.close();
+      }
+
+      await assert.rejects(
+        connectHttp('bad-token', { url, headers: { Authorization: 'Bearer wrong' } }),
+        (error: unknown) =>
+          /401 Unauthorized/.test((error as Error).message) && /Check the "headers"/.test((error as Error).message),
+      );
+
+      // A header can read its token from the environment.
+      process.env.KIRO_TEST_MCP_TOKEN = 'test-token';
+      const fromEnv = await connectHttp('from-env', {
+        url,
+        headers: { Authorization: 'Bearer ${KIRO_TEST_MCP_TOKEN}' },
+      });
+      try {
+        assert.deepEqual(await fromEnv.callTool('http_echo', { text: 'env' }), { content: 'echo: env', isError: false });
+      } finally {
+        await fromEnv.close();
+        delete process.env.KIRO_TEST_MCP_TOKEN;
+      }
+
+      // A short per-server timeout fails the call instead of hanging.
+      const quick = await connectHttp('quick', { url, headers: { Authorization: 'Bearer test-token' }, timeoutMs: 100 });
+      try {
+        await assert.rejects(quick.callTool('http_slow', {}), /did not answer within 0\.1s/);
+      } finally {
+        await quick.close();
+      }
+
+      // Ctrl+C reaches a blocking call: the abort ends it at once.
+      const blocking = await connectHttp('blocking', {
+        url,
+        headers: { Authorization: 'Bearer test-token' },
+        timeoutMs: 3_600_000,
+      });
+      try {
+        const controller = new AbortController();
+        const started = Date.now();
+        const pending = blocking.callTool('http_slow', {}, controller.signal);
+        setTimeout(() => controller.abort(), 50);
+        await assert.rejects(pending, /cancelled/);
+        assert.ok(Date.now() - started < 2_000, 'the abort wins over the long timeout');
+        assert.equal((await blocking.callTool('http_echo', { text: 'still here' })).content, 'echo: still here');
+      } finally {
+        await blocking.close();
+      }
+
+      // SSE parsing: the reply is the last message with an id, and a partial
+      // data line is skipped rather than thrown.
+      assert.deepEqual(readSseMessage('event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\ndata: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}\n\n'), {
+        jsonrpc: '2.0',
+        id: 7,
+        result: { ok: true },
+      });
+      assert.equal(readSseMessage('data: not json\n\n'), undefined);
+      assert.deepEqual(readSseMessage('data: {"jsonrpc":"2.0","id":1,"result":null}\n\n'), {
+        jsonrpc: '2.0',
+        id: 1,
+        result: null,
+      });
+      assert.equal(readSseMessage(''), undefined);
+
+      // Through setupMcp: the entry starts, and /mcp names the url and timeout.
+      const dir = await tempDir('kiro-mcp-http-');
+      const home = path.join(dir, 'home');
+      await mkdir(path.join(dir, '.kiro'), { recursive: true });
+      await mkdir(path.join(home, '.kiro'), { recursive: true });
+      try {
+        await writeFile(
+          path.join(dir, '.kiro', 'mcp.json'),
+          JSON.stringify({
+            mcpServers: {
+              demo: { type: 'http', url, headers: { Authorization: 'Bearer test-token' }, timeout: 3_600_000 },
+              noUrl: { type: 'http' },
+            },
+          }),
+          'utf8',
+        );
+        const setup = await setupMcp(dir, { home });
+        try {
+          const demo = setup.statuses.find((status) => status.name === 'demo');
+          assert.equal(demo?.state, 'ready');
+          assert.equal(demo?.transport, 'http');
+          assert.equal(demo?.tools, 2);
+          assert.equal(setup.statuses.find((status) => status.name === 'noUrl')?.state, 'skipped');
+          const names = setup.definitions.map((definition) => definition.function.name).sort();
+          assert.deepEqual(names, ['mcp__demo__http_echo', 'mcp__demo__http_slow']);
+          const status = formatMcpStatus(setup, dir);
+          assert.match(status, new RegExp(`ok\\s+demo \\(2 tools\\)`));
+          assert.match(status, /timeout 3600s/);
+        } finally {
+          await setup.close();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+
+      // An unreachable URL is an error status, not a crash.
+      const dir2 = await tempDir('kiro-mcp-http-down-');
+      const home2 = path.join(dir2, 'home');
+      await mkdir(path.join(dir2, '.kiro'), { recursive: true });
+      try {
+        await writeFile(
+          path.join(dir2, '.kiro', 'mcp.json'),
+          JSON.stringify({ mcpServers: { down: { type: 'http', url: 'http://127.0.0.1:9/mcp' } } }),
+          'utf8',
+        );
+        const setup = await setupMcp(dir2, { home: home2 });
+        try {
+          assert.equal(setup.statuses[0]?.state, 'error');
+          assert.match(setup.statuses[0]?.detail ?? '', /failed over HTTP|could not reach/);
+          assert.equal(setup.tools.length, 0);
+        } finally {
+          await setup.close();
+        }
+      } finally {
+        await rm(dir2, { recursive: true, force: true });
+      }
+    } finally {
+      // Kill the fixture and drop its pipes, or the parent keeps the test run alive.
+      server.kill('SIGKILL');
+      server.stdout?.destroy();
+      server.stderr?.destroy();
+      server.unref();
     }
   });
 
