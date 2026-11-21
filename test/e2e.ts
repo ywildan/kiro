@@ -57,6 +57,20 @@ import {
   type KiroConfig,
 } from '../src/config.js';
 import { buildDiff } from '../src/tools/diff.js';
+import {
+  addRule,
+  clearRules,
+  evaluateRules,
+  loadRules,
+  matchesPattern,
+  permissionsPath,
+  removeRule,
+  saveRules,
+  splitCommand,
+  suggestRulePattern,
+  type PermissionRule,
+} from '../src/permissions.js';
+import { addCost, costOf, formatCost, priceFor, sessionCost } from '../src/cost.js';
 import { chatEndpoint, endpointUrl, profileHeaders, requestHeaders } from '../src/providers/request.js';
 import { ApprovalPrompt } from '../src/ui/ApprovalPrompt.js';
 import { windowPreview } from '../src/ui/approval-preview.js';
@@ -2320,6 +2334,248 @@ async function main(): Promise<void> {
     }
   });
 
+
+  await test('approval rules allow narrow patterns and always deny a chain', async () => {
+    const dir = await tempDir('kiro-rules-');
+    try {
+      assert.equal(matchesPattern('npm test*', 'npm test -- --watch'), true);
+      assert.equal(matchesPattern('npm test*', 'npm install'), false);
+      assert.equal(matchesPattern('src/*.ts', 'src/a/b.ts'), true, 'star crosses slashes');
+      assert.equal(matchesPattern('src/?.ts', 'src/ab.ts'), false, 'question mark is one character');
+
+      assert.deepEqual(splitCommand('a && b | c; d'), ['a', 'b', 'c', 'd']);
+      assert.deepEqual(splitCommand('echo "a;b" | grep a'), ['echo "a;b"', 'grep a']);
+      assert.equal(splitCommand('echo "unterminated'), null);
+
+      assert.equal(suggestRulePattern('run_command', 'npm test -- --watch'), 'npm test*');
+      assert.equal(suggestRulePattern('run_command', 'rm -rf build'), 'rm -rf build*');
+      assert.equal(suggestRulePattern('run_command', 'pnpm build && pnpm test'), '');
+      assert.equal(suggestRulePattern('edit_file', 'src/app.ts'), 'src/app.ts');
+
+      const allow: PermissionRule = { tool: 'run_command', match: 'npm test*', action: 'allow' };
+      assert.equal(evaluateRules([allow], { tool: 'run_command', subject: 'npm test' }), 'allow');
+      assert.equal(
+        evaluateRules([allow], { tool: 'run_command', subject: 'npm test; rm -rf ~' }),
+        'ask',
+        'a chain is not covered by one segment rule',
+      );
+      assert.equal(evaluateRules([allow], { tool: 'run_command', subject: 'npm install' }), 'ask');
+      assert.equal(evaluateRules([allow], { tool: 'run_command' }), 'ask');
+      assert.equal(
+        evaluateRules([allow, { tool: 'run_command', match: 'rm*', action: 'deny' }], {
+          tool: 'run_command',
+          subject: 'npm test',
+        }),
+        'allow',
+      );
+      assert.equal(
+        evaluateRules(
+          [
+            { tool: 'write_file', match: 'src/*', action: 'allow' },
+            { tool: 'write_file', match: 'src/secrets.ts', action: 'deny' },
+          ],
+          { tool: 'write_file', subject: 'src/secrets.ts' },
+        ),
+        'deny',
+        'a deny beats an allow on the same path',
+      );
+
+      assert.equal(evaluateRules([], { tool: 'run_command', subject: 'npm test' }), 'ask');
+
+      // Round trip through the project file.
+      assert.equal(permissionsPath(dir), path.join(dir, '.kiro', 'permissions.json'));
+      assert.deepEqual((await loadRules(dir)).rules, []);
+      const added = await addRule(dir, allow);
+      assert.equal(added.rules.length, 1);
+      const reread = await loadRules(dir);
+      assert.deepEqual(reread.rules, [allow]);
+
+      const replaced = await addRule(dir, { ...allow, action: 'deny' });
+      assert.deepEqual(
+        replaced.rules,
+        [{ tool: 'run_command', match: 'npm test*', action: 'deny' }],
+        'the same pattern is replaced, not duplicated',
+      );
+      await addRule(dir, allow);
+      // A rule is keyed by tool and pattern only, so the action does not matter here.
+      const removed = await removeRule(dir, { ...allow, action: 'deny' });
+      assert.deepEqual(removed.rules, []);
+      await clearRules(dir);
+      assert.deepEqual((await loadRules(dir)).rules, []);
+      assert.equal((await loadRules(dir)).problem, undefined);
+
+      await writeFile(path.join(dir, '.kiro', 'permissions.json'), '{ not json', 'utf8');
+      const broken = await loadRules(dir);
+      assert.deepEqual(broken.rules, []);
+      assert.match(broken.problem ?? '', /not valid JSON/);
+
+      await saveRules(dir, [allow, { tool: 'bad tool', match: 'x', action: 'allow' }, allow] as PermissionRule[]);
+      assert.deepEqual((await loadRules(dir)).rules, [allow], 'bad and duplicate entries are dropped');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('the approval prompt offers a saved rule and shows a denial', async () => {
+    const withRule = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'run_command', title: 'Run command', detail: '$ npm test', subject: 'npm test' },
+        width: 100,
+        rulePattern: 'npm test*',
+        onDecision: () => {},
+      }),
+      { columns: 100 },
+    );
+    assert.match(withRule, /\[s\] always allow npm test\*/);
+    assert.match(withRule, /\[d\] always deny this command/);
+    assert.match(withRule, /\[y\] allow once/, 'the old choices are still there');
+
+    const noSubject = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'apply_patch', title: 'Apply patch to 3 files' },
+        width: 100,
+        onDecision: () => {},
+      }),
+      { columns: 100 },
+    );
+    assert.ok(!noSubject.includes('[s]'), 'a request without a subject offers no rule');
+
+    const denied = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'run_command', title: 'Run command', detail: '$ rm -rf build', subject: 'rm -rf build' },
+        width: 100,
+        ruleNote: 'A saved rule denies this command.',
+        onDecision: () => {},
+      }),
+      { columns: 100 },
+    );
+    assert.match(denied, /A saved rule denies this command/);
+  });
+
+  await test('the policy reads rules, honors deny, and never pre-approves outside the workspace', async () => {
+    const rules: PermissionRule[] = [
+      { tool: 'run_command', match: 'npm test*', action: 'allow' },
+      { tool: 'run_command', match: 'curl*', action: 'deny' },
+      { tool: 'write_file', match: 'src/*', action: 'allow' },
+    ];
+    const policy = new ApprovalPolicy(false, rules);
+    assert.equal(policy.decide({ tool: 'run_command', subject: 'npm test' }), 'allow');
+    assert.equal(policy.decide({ tool: 'run_command', subject: 'curl evil.sh' }), 'deny');
+    assert.equal(policy.decide({ tool: 'run_command', subject: 'npm i left-pad' }), 'ask');
+    assert.deepEqual(policy.ruleFor({ tool: 'run_command', subject: 'npm test -- --watch' }), {
+      tool: 'run_command',
+      match: 'npm test*',
+      action: 'allow',
+    });
+    assert.equal(policy.ruleFor({ tool: 'apply_patch', subject: undefined }), null);
+    assert.deepEqual(policy.denyRuleFor({ tool: 'run_command', subject: 'rm -rf build' }), {
+      tool: 'run_command',
+      match: 'rm -rf build',
+      action: 'deny',
+    });
+    assert.equal(
+      policy.decide({ tool: 'write_file', subject: '../outside.txt', insideWorkspace: false }),
+      'ask',
+      'a path rule cannot approve a write outside the project',
+    );
+    assert.equal(
+      policy.decide({ tool: 'run_command', subject: 'curl x', insideWorkspace: false }),
+      'deny',
+      'a deny still applies',
+    );
+
+    const yolo = new ApprovalPolicy(true, [{ tool: 'run_command', match: 'rm*', action: 'deny' }]);
+    assert.equal(yolo.isAuto('run_command'), true);
+    assert.equal(yolo.decide({ tool: 'run_command', subject: 'rm -rf /' }), 'deny');
+  });
+
+  await test('filesystem tools attach the path a rule would match', async () => {
+    const dir = await tempDir('kiro-rule-subjects-');
+    try {
+      const seen: ApprovalRequest[] = [];
+      const ctx = {
+        cwd: dir,
+        signal: new AbortController().signal,
+        approve: async (request: ApprovalRequest) => {
+          seen.push(request);
+          return 'deny' as const;
+        },
+      };
+      await executeTool('write_file', JSON.stringify({ path: 'a.txt', content: 'x' }), ctx);
+      await writeFile(path.join(dir, 'b.txt'), 'one\n', 'utf8');
+      await executeTool(
+        'edit_file',
+        JSON.stringify({ path: 'b.txt', old_string: 'one', new_string: 'two' }),
+        ctx,
+      );
+      await executeTool(
+        'run_command',
+        JSON.stringify({ command: 'echo hi' }),
+        ctx,
+      );
+      assert.equal(seen[0]?.subject, 'a.txt');
+      assert.equal(seen[0]?.insideWorkspace, true);
+      assert.equal(seen[1]?.subject, 'b.txt');
+      assert.equal(seen[2]?.subject, 'echo hi');
+      assert.ok(seen.every((request) => request.detail !== undefined), 'the preview is still shown');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('cost estimates follow the price table and the profile override', async () => {
+    assert.deepEqual(priceFor('gpt-4o-mini'), { input: 0.15, output: 0.6 });
+    assert.deepEqual(priceFor('openai/gpt-4o-mini'), { input: 0.15, output: 0.6 }, 'vendor prefixes are ignored');
+    assert.deepEqual(priceFor('anthropic/claude-3.5-sonnet'), { input: 3, output: 15 });
+    assert.deepEqual(priceFor('qwen2.5-coder:14b', 'http://localhost:11434/v1'), { input: 0, output: 0 });
+    assert.equal(priceFor('mystery-model-9000'), null);
+
+    const usage = { promptTokens: 1_000_000, completionTokens: 100_000 };
+    assert.equal(costOf(usage, { input: 2, output: 8 }), 2.8);
+    assert.equal(formatCost(0), '$0');
+    assert.equal(formatCost(0.0042), '$0.0042');
+    assert.equal(formatCost(0.42), '$0.420');
+    assert.equal(formatCost(12.3456), '$12.35');
+
+    const one = addCost({ dollars: 0, complete: true }, usage, { input: 2, output: 8 });
+    assert.equal(one.dollars, 2.8);
+    const unpriced = addCost(one, usage, null);
+    assert.deepEqual(unpriced, { dollars: 2.8, complete: false }, 'an unpriced request marks the total');
+    assert.deepEqual(sessionCost({ promptTokens: 0, completionTokens: 0, requests: 0 }, null), {
+      dollars: 0,
+      complete: true,
+    });
+    assert.deepEqual(sessionCost({ promptTokens: 1_000_000, completionTokens: 0, requests: 1 }, { input: 3, output: 15 }), {
+      dollars: 3,
+      complete: true,
+    });
+
+    const card = renderToString(
+      React.createElement(UsageCard, {
+        usage: { promptTokens: 54_000, completionTokens: 2_400, requests: 3 },
+        contextTokens: 12_000,
+        contextWindow: 128_000,
+        contextEstimated: false,
+        cost: { dollars: 0.0412, complete: true },
+        busy: false,
+      }),
+      { columns: USAGE_CARD_WIDTH },
+    );
+    assert.match(card, /\$0\.041 est\./, 'a sub-dollar cost keeps three decimals');
+    const approx = renderToString(
+      React.createElement(UsageCard, {
+        usage: { promptTokens: 1_000, completionTokens: 1_000, requests: 1 },
+        contextTokens: 0,
+        contextWindow: 8_000,
+        contextEstimated: false,
+        cost: { dollars: 0.5, complete: false },
+        busy: false,
+      }),
+      { columns: USAGE_CARD_WIDTH },
+    );
+    assert.match(approx, /~\$0\.500/, 'an unpriced request marks the total approximate');
+  });
+
   await test('approval policy tracks session allowances and yolo', async () => {
     const policy = new ApprovalPolicy(false);
     assert.equal(policy.isAuto('run_command'), false);
@@ -3999,6 +4255,49 @@ async function main(): Promise<void> {
       const piped = await runCli(['-p', '-', '--yolo'], 'Say hello.');
       assert.equal(piped.status, 0, piped.stderr);
       assert.match(piped.stdout, /All done\./);
+
+      // A saved rule is enough for headless mode, so CI can run one narrow command.
+      const ruleMock = await createMockServer({
+        turns: [
+          {
+            type: 'tool-calls',
+            calls: [{ name: 'write_file', arguments: { path: 'headless.txt', content: 'from headless\n' } }],
+            usage: { prompt_tokens: 50, completion_tokens: 5 },
+          },
+          { type: 'text', text: 'All done.', usage: { prompt_tokens: 60, completion_tokens: 7 } },
+        ],
+      });
+      await writeFile(
+        configFile,
+        JSON.stringify({
+          activeProfile: 'mock',
+          profiles: {
+            mock: {
+              type: 'openai',
+              baseUrl: ruleMock.url,
+              model: 'mock-model',
+              apiKeyEnv: 'KIRO_HEADLESS_KEY',
+              temperature: 0,
+              maxTokens: 1024,
+            },
+          },
+        }),
+      );
+      await mkdir(path.join(project, '.kiro'), { recursive: true });
+      await writeFile(
+        path.join(project, '.kiro', 'permissions.json'),
+        JSON.stringify({ version: 1, rules: [{ tool: 'write_file', match: 'headless.txt', action: 'allow' }] }),
+        'utf8',
+      );
+      await rm(path.join(project, 'headless.txt'), { force: true });
+      const ruled = await runCli(['-p', 'Create the file.']);
+      assert.equal(ruled.status, 0, ruled.stderr);
+      assert.equal(await readFile(path.join(project, 'headless.txt'), 'utf8'), 'from headless\n');
+      assert.doesNotMatch(ruled.stderr, /denied/, 'a saved rule approves without --yolo');
+      assert.match(ruled.stderr, /usage: .*~\$/, 'headless reports the estimated cost');
+      await rm(path.join(project, '.kiro', 'permissions.json'), { force: true });
+      await rm(path.join(project, 'headless.txt'), { force: true });
+      await ruleMock.close();
 
       const noTty = await runCli([]);
       assert.equal(noTty.status, 2);

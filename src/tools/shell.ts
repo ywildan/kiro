@@ -94,6 +94,7 @@ export const runCommandTool: Tool = {
       tool: 'run_command',
       title: 'Run command',
       detail: `$ ${command}`,
+      subject: command.trim(),
     };
     if (ctx.signal.aborted) return denied('Cancelled by user.');
     const decision = await ctx.approve(request);

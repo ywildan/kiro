@@ -1,6 +1,13 @@
 import type { ToolDefinition } from '../providers/types.js';
 
-export type ApprovalDecision = 'allow' | 'allow-session' | 'deny';
+export type ApprovalDecision =
+  | 'allow'
+  | 'allow-session'
+  | 'deny'
+  /** Allow and remember a pattern in .kiro/permissions.json. */
+  | 'allow-rule'
+  /** Deny and remember the exact subject as a rule, so it is refused again. */
+  | 'deny-rule';
 
 export interface ApprovalRequest {
   tool: string;
@@ -9,6 +16,13 @@ export interface ApprovalRequest {
   /** Full detail for the preview: a diff for file writes, the command for shell. */
   detail?: string;
   warning?: string;
+  /**
+   * What a saved rule matches: the command text, or the workspace-relative path.
+   * Absent means the request can never be auto-approved by a rule.
+   */
+  subject?: string;
+  /** False when the change escapes the workspace; rules must not pre-approve it. */
+  insideWorkspace?: boolean;
 }
 
 export type ApproveFn = (request: ApprovalRequest) => Promise<ApprovalDecision>;

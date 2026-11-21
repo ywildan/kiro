@@ -21,6 +21,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/export', usage: '[file]', description: 'write the transcript to a Markdown file' },
   { name: '/mouse', description: 'toggle mouse reporting (wheel scroll vs text selection)' },
   { name: '/allow', usage: '[clear]', description: 'manage tools that skip approval' },
+  { name: '/rules', usage: '[clear | remove <n>]', description: 'saved approval rules in .kiro/permissions.json' },
   { name: '/exit', description: 'quit Kiro' },
 ];
 

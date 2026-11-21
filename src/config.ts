@@ -21,6 +21,11 @@ export interface ProfileConfig {
    * API-version header. Values may use `${VAR}` to read the environment.
    */
   headers?: Record<string, string>;
+  /**
+   * Overrides the built-in price table for this model, in dollars per million
+   * tokens. Set it for a private or resold endpoint where the list price is wrong.
+   */
+  pricing?: { input: number; output: number };
 }
 
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -217,6 +222,26 @@ export function validateHeaders(profileName: string, raw: unknown): Record<strin
   return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
+function validatePricing(
+  profileName: string,
+  raw: unknown,
+): { input: number; output: number } | undefined {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) {
+    throw new ConfigError(`Profile "${profileName}": "pricing" must be an object.`);
+  }
+  const read = (key: 'input' | 'output'): number => {
+    const value = raw[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new ConfigError(
+        `Profile "${profileName}": "pricing.${key}" must be a non-negative number (dollars per million tokens).`,
+      );
+    }
+    return value;
+  };
+  return { input: read('input'), output: read('output') };
+}
+
 function validateProfile(name: string, raw: unknown): ProfileConfig {
   if (!isRecord(raw)) {
     throw new ConfigError(`Profile "${name}" must be an object.`);
@@ -266,6 +291,7 @@ function validateProfile(name: string, raw: unknown): ProfileConfig {
     maxTokens: raw.maxTokens as number | undefined,
     contextWindow: raw.contextWindow as number | undefined,
     headers: validateHeaders(name, raw.headers),
+    pricing: validatePricing(name, raw.pricing),
   };
 }
 
@@ -423,6 +449,8 @@ export async function saveConfig(config: KiroConfig, options: SaveConfigOptions 
     else delete merged.models;
     if (profile.headers !== undefined) merged.headers = profile.headers;
     else delete merged.headers;
+    if (profile.pricing !== undefined) merged.pricing = profile.pricing;
+    else delete merged.pricing;
     profiles[name] = merged;
   }
 

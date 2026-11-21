@@ -229,6 +229,8 @@ const writeFileTool: Tool = {
       warning: resolved.outside
         ? `This path is outside the working directory: ${resolved.abs}`
         : undefined,
+      subject: resolved.display,
+      insideWorkspace: !resolved.outside,
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');
@@ -427,6 +429,8 @@ const editFileTool: Tool = {
       warning: resolved.outside
         ? `This path is outside the working directory: ${resolved.abs}`
         : undefined,
+      subject: resolved.display,
+      insideWorkspace: !resolved.outside,
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');
@@ -517,6 +521,8 @@ const multiEditTool: Tool = {
       warning: resolved.outside
         ? `This path is outside the working directory: ${resolved.abs}`
         : undefined,
+      subject: resolved.display,
+      insideWorkspace: !resolved.outside,
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');

@@ -187,6 +187,7 @@ Set `KIRO_ENV_PATH` to use a different `.env` file.
 | `maxTokens` | no | Maximum response tokens. |
 | `contextWindow` | no | Approximate context window in tokens, at least 1000. Defaults to `128000`; drives the ctx meter and compaction. |
 | `headers` | no | Extra request headers, for gateways that need a routing or API-version header. Values may use `${VAR}`. `Authorization` and the other headers Kiro sends are rejected. |
+| `pricing` | no | Price overrides in dollars per million tokens: `{ "input": 0.5, "output": 1.5 }`. Used for the cost estimate; the built-in table is a fallback. |
 
 `activeProfile` selects the profile used at startup. `/model <name>` switches at runtime and `--profile` switches for one run.
 
@@ -305,7 +306,7 @@ Reasoning traces stream as a dim block and collapse to `reasoning (done, not sav
 
 Each finished reply shows its duration and, when the endpoint reports usage, output throughput (`8.4s · 23 tok/s`). Both are display-only and are not stored in sessions.
 
-On terminals at least 110 columns wide with room for 9 transcript rows, a Usage card sits to the right of the conversation. It shows session token totals (`↑` sent, `↓` received), API requests, a context gauge, and the last reply's timing. Totals come from endpoint usage, accumulate across tool rounds, and survive `/resume`; compaction requests are not counted. A `~` marks an estimated context number. Below 110 columns the card hides and `ctx` returns to the status bar. `/usage` toggles it, and `/context` prints the totals at any width.
+On terminals at least 110 columns wide with room for 9 transcript rows, a Usage card sits to the right of the conversation. It shows session token totals (`↑` sent, `↓` received), API requests, an estimated cost, a context gauge, and the last reply's timing. Totals come from endpoint usage, accumulate across tool rounds, and survive `/resume`; compaction requests are not counted. A `~` marks an estimated context number. Below 110 columns the card hides and `ctx` returns to the status bar. `/usage` toggles it, and `/context` prints the totals at any width.
 
 Replies render as Markdown: headings, emphasis, inline code, lists, task checkboxes, blockquotes, links, code blocks, and tables. Table columns size to their content, honour alignment markers, and wrap; a table too wide to read falls back to plain rows. Unknown markers stay literal, so streaming never breaks the layout.
 
@@ -346,6 +347,9 @@ Tool results are one-line summaries. `Ctrl+O` expands the latest result inline; 
 | `/mouse` | Toggle mouse reporting: wheel scroll vs normal text selection |
 | `/allow` | List tools that skip approval for this session |
 | `/allow clear` | Ask for approval again for every tool |
+| `/rules` | List saved rules in `.kiro/permissions.json`, numbered |
+| `/rules remove <n>` | Delete one saved rule |
+| `/rules clear` | Delete the rule file |
 | `/exit` | Quit |
 
 `/model` has two steps. The first lists profiles grouped by endpoint, with the active one marked `*`; `Enter` opens the models. The second lists stored model ids with the current one marked `*`; `Enter` applies it and saves the choice. On the model step, type to filter (all space-separated terms must match), `Esc` clears the query and then goes back, and `Ctrl+R` refetches `GET /models`. `Ctrl+C` closes the picker.
@@ -410,6 +414,8 @@ Approvals show a diff, or the exact command, and offer:
 
 - `[y]` allow once
 - `[a]` allow this tool for the rest of the session (the status bar shows `auto:<tool>`; `/allow clear` revokes it)
+- `[s]` always allow this pattern (saved to `.kiro/permissions.json`; the prompt names the pattern first)
+- `[d]` always deny this exact command or path
 - `[n]` deny and return the refusal to the model
 
 The preview keeps six rows. A diff drops its `---`/`+++` file headers and window markers so the changed lines fit, and a long command keeps both ends, since a destructive step is often the last line. A preview that still does not fit ends with a count of the hidden rows.
@@ -419,6 +425,63 @@ Paths resolve against the working directory. Symlinks and `..` escapes are caugh
 Read-only tools (`read_file`, `list_dir`, `glob`, `grep`) in one response run in parallel, and results are appended in call order. A write, edit, patch, or command breaks the batch and runs with an approval prompt.
 
 `--yolo` skips all approvals. The status bar shows a red `YOLO` badge, the transcript warns once, and `/help` repeats it. It cannot be turned off inside the session; restart without the flag. Use it only in directories you trust.
+
+### Cost estimate
+
+The Usage card shows an estimated cost in dollars next to the token counts, and
+`/context` prints the same number with the price used. Prices come from a small
+built-in table matched on the model id (`gpt-4o`, `claude-*-sonnet`, `gemini-*-flash`,
+`deepseek-*`, and similar), in dollars per million tokens. Local endpoints
+(`localhost`, a private address, `.local`) report `$0 free`. A `~` marks a total
+that includes a request whose model had no known price.
+
+The table is a convenience, not a bill. Set `pricing` in the profile for a
+private or resold endpoint:
+
+```json
+{
+  "type": "openai",
+  "baseUrl": "https://gateway.internal/v1",
+  "model": "team-large",
+  "pricing": { "input": 0.5, "output": 1.5 }
+}
+```
+
+Headless runs print one line of usage and cost to stderr at the end of a turn,
+so a CI job can watch spend without parsing the transcript.
+
+### Saved approval rules
+
+`[s]` and `[d]` write a rule to `.kiro/permissions.json` in the project, so the
+decision survives restarts and covers headless runs in CI:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    { "tool": "run_command", "match": "npm test*", "action": "allow" },
+    { "tool": "run_command", "match": "curl*", "action": "deny" }
+  ]
+}
+```
+
+`tool` is a tool name or `*`; `match` is a glob over the command text or the
+workspace-relative path, where `*` matches any characters (including `/`) and
+`?` matches one. The prompt shows the pattern before it is saved: `[s]` on
+`npm test -- --watch` offers `npm test*`, and on `rm -rf build` it offers
+`rm -rf build*` rather than the dangerous `rm*`.
+
+A shell command is split on `;`, `&&`, `||`, `|`, and newlines, and every part
+must be allowed, so `npm test*` never covers `npm test; rm -rf ~`. A deny rule
+always wins, and a deny still applies under `--yolo`. A rule never pre-approves
+a write outside the working directory; those always ask.
+
+Rules are read at startup and whenever the working directory changes. `/rules`
+lists them numbered, `/rules remove <n>` deletes one, and `/rules clear` removes
+the file. A broken file reports once and is treated as empty, so it cannot lock
+you out. Headless runs use the same rules and never write new ones: `kiro -p`
+approves only what a saved rule covers, plus `--yolo`. Set `KIRO_PERMISSIONS_PATH`
+to keep the rules outside the project.
 
 ### Undo and checkpoints
 
@@ -512,6 +575,8 @@ test/
 - `@` lists files only and stops at 50,000 paths; directories and ignored files are not offered.
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
 - No sub-agents, MCP, plugins, web search, image input, themes, or git integration.
+- Approval rules match a glob, not a shell grammar: a rule for `npm test*` also covers `npm test-evil`. Review saved rules with `/rules` when a project's rules come from someone else.
+- The cost estimate uses a built-in list-price table that ages; `/context` names the price it used, and `pricing` in the profile overrides it.
 - Sessions are single-process and stored as plaintext JSON. There is no delete or rename command. The `/resume` picker can load a session from another directory and switches the working directory to it; `/export` writes a Markdown transcript you can keep.
 - `/undo` covers `write_file`, `edit_file`, `multi_edit`, and `apply_patch` only. It keeps the last 30 calls, and `run_command` changes are outside its reach; use Git for a complete safety net.
 - Prompt history is plaintext, capped at 200 entries per directory, and only recalled in the TUI (not in `-p` mode).
