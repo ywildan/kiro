@@ -102,6 +102,16 @@ function toolLines(
       suffix,
     },
   ];
+  if (item.status === 'running' && item.liveTail) {
+    // The newest output line, so a long build shows progress instead of a spinner.
+    const livePrefix = '  ⎿  ';
+    lines.push({
+      prefix: livePrefix,
+      prefixDim: true,
+      text: truncateToWidth(item.liveTail, Math.max(1, width - displayWidth(livePrefix))),
+      dim: true,
+    });
+  }
   if (item.resultSummary && item.status !== 'running') {
     const resultPrefix = '  ⎿  ';
     const resultWidth = Math.max(1, width - displayWidth(resultPrefix));

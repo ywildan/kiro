@@ -90,6 +90,7 @@ import { loadPromptHistory, recordPrompt } from './prompt-history.js';
 import { StatusBar, type Activity } from './StatusBar.js';
 import { summarizeToolArgs } from './text.js';
 import { MAX_PREVIEW_LINES } from './approval-preview.js';
+import { formatMcpStatus, type McpSetup } from '../mcp/registry.js';
 import {
   UsageCard,
   USAGE_CARD_GAP,
@@ -146,6 +147,8 @@ interface AppProps {
   mouseEnabled: boolean;
   initialSession?: SessionRecord | null;
   startupNotices?: StartupNotice[];
+  /** MCP servers that started for this session; null when MCP is off. */
+  mcp?: McpSetup | null;
 }
 
 interface WizardPromptState extends TextPrompt {
@@ -192,6 +195,7 @@ export function App({
   mouseEnabled,
   initialSession,
   startupNotices,
+  mcp,
 }: AppProps): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -226,6 +230,8 @@ export function App({
   const [wizardPrompt, setWizardPrompt] = useState<WizardPromptState | null>(null);
   const [wizardActive, setWizardActive] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
+  /** Newest output line of the running command, shown in the status bar. */
+  const [liveTail, setLiveTail] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<AskUserRequest | null>(null);
@@ -957,8 +963,23 @@ export function App({
                 },
               ]);
               break;
+            case 'tool-output':
+              setLiveTail(event.tail);
+              setItems((current) => {
+                const index = current.findIndex(
+                  (item) => item.kind === 'tool' && item.callId === event.toolCall.id,
+                );
+                if (index === -1) return current;
+                const item = current[index];
+                if (item?.kind !== 'tool' || item.liveTail === event.tail) return current;
+                const next = [...current];
+                next[index] = { ...item, liveTail: event.tail };
+                return next;
+              });
+              break;
             case 'tool-end':
               setActiveTool(null);
+              setLiveTail(null);
               setItems((current) => {
                 const index = current.findIndex(
                   (item) => item.kind === 'tool' && item.callId === event.toolCall.id && item.status === 'running',
@@ -970,6 +991,7 @@ export function App({
                 next[index] = {
                   ...item,
                   status: event.result.status,
+                  liveTail: undefined,
                   resultSummary: event.result.summary,
                   resultFull: event.result.content.slice(0, MAX_EXPANDED_TOOL_CHARS),
                   durationMs: event.durationMs,
@@ -1646,6 +1668,14 @@ export function App({
           );
           return;
         }
+        case '/mcp': {
+          if (argument) {
+            addNotice('error', 'Usage: /mcp (lists configured servers for this session)');
+            return;
+          }
+          addNotice('info', formatMcpStatus(mcp ?? null, cwd));
+          return;
+        }
         case '/rules': {
           const rules = await refreshRules(true);
           if (argument === 'clear') {
@@ -2126,6 +2156,7 @@ export function App({
         cwd={cwd}
         activity={activity}
         toolName={activeTool ?? undefined}
+        liveTail={liveTail}
         busySince={busySince ?? undefined}
         queued={queuedCount > 0 ? queuedCount : undefined}
         yolo={yolo}

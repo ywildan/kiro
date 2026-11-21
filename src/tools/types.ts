@@ -59,6 +59,11 @@ export interface ToolContext {
   approve: ApproveFn;
   /** Undefined outside the TUI: headless runs cannot answer questions. */
   askUser?: AskUserFn;
+  /**
+   * Live output for a running tool (only `run_command` uses it). The UI draws
+   * the last line; headless mode ignores it.
+   */
+  onOutput?: (update: { tool: string; chunk: string; tail: string }) => void;
 }
 
 export type ToolStatus = 'ok' | 'error' | 'denied';
@@ -76,6 +81,8 @@ export interface Tool {
   /** Read-only tools never mutate state and may run in parallel. */
   readOnly?: boolean;
   run(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
+  /** True for tools added by an MCP server; they are never auto-approved. */
+  mcp?: boolean;
 }
 
 export async function requestApproval(

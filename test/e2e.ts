@@ -71,6 +71,12 @@ import {
   type PermissionRule,
 } from '../src/permissions.js';
 import { addCost, costOf, formatCost, priceFor, sessionCost } from '../src/cost.js';
+import { RpcChannel, RpcError, RpcTimeoutError, createLineReader } from '../src/mcp/rpc.js';
+import { flattenContent, mcpToolName, readToolList } from '../src/mcp/client.js';
+import { loadMcpConfig, mcpEntryProblem, readMcpFile } from '../src/mcp/config.js';
+import { formatMcpStatus, isMcpTool, mcpNeedsApproval, setupMcp } from '../src/mcp/registry.js';
+import { connectStdio } from '../src/mcp/stdio.js';
+import { setExtraTools, allToolDefinitions, allTools } from '../src/tools/index.js';
 import { chatEndpoint, endpointUrl, profileHeaders, requestHeaders } from '../src/providers/request.js';
 import { ApprovalPrompt } from '../src/ui/ApprovalPrompt.js';
 import { windowPreview } from '../src/ui/approval-preview.js';
@@ -2335,6 +2341,451 @@ async function main(): Promise<void> {
   });
 
 
+
+
+  await test('the MCP JSON-RPC channel frames messages, matches ids, and fails cleanly', async () => {
+    const written: string[] = [];
+    const channel = new RpcChannel({
+      write: (line) => written.push(line),
+      timeoutMs: 200,
+      onNotice: (message) => written.push(`notice:${message}`),
+    });
+    channel.handle('roots/list', () => ({ roots: [] }));
+
+    const pending = channel.request('tools/list', {});
+    assert.equal(written.length, 1);
+    const sent = JSON.parse(written[0]!);
+    assert.deepEqual(sent, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+    assert.ok(written[0]!.endsWith('\n'), 'every message is one line');
+
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [] } }));
+    assert.deepEqual(await pending, { tools: [] });
+
+    // A server-to-client request is answered, an unknown one gets an error.
+    // Handler answers land on a microtask, so give them a turn.
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'roots/list' }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(JSON.parse(written.at(-1)!).id, 99);
+    assert.deepEqual(JSON.parse(written.at(-1)!).result, { roots: [] });
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', id: 98, method: 'sampling/createMessage' }));
+    await new Promise((resolve) => setImmediate(resolve));
+    const unknownReply = JSON.parse(written.at(-1)!);
+    assert.equal(unknownReply.error?.code, -32601);
+
+    // Non-JSON output and notifications never throw.
+    channel.receive('server said hello');
+    assert.ok(written.some((line) => line.startsWith('notice:MCP server printed non-JSON')));
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/progress' }));
+    assert.ok(written.some((line) => line.includes('notification ignored')));
+
+    const failing = channel.request('tools/call', { name: 'x' });
+    channel.receive(
+      JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32602, message: 'bad args' } }),
+    );
+    await assert.rejects(failing, (error: unknown) => error instanceof RpcError && /bad args/.test(error.message));
+
+    const timingOut = channel.request('slow/thing');
+    await assert.rejects(timingOut, (error: unknown) => error instanceof RpcTimeoutError);
+
+    const reader = createLineReader(() => {});
+    const lines: string[] = [];
+    const collect = createLineReader((line) => lines.push(line));
+    collect.push('{"a":1}\n{"b"');
+    collect.push(':2}\n\n');
+    collect.flush();
+    assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '']);
+    void reader;
+
+    channel.close();
+    await assert.rejects(channel.request('after/close'), /closed/);
+  });
+
+  await test('MCP tool definitions and content are normalized', async () => {
+    assert.equal(mcpToolName('my-server', 'do.it'), 'mcp__my_server__do_it');
+    assert.equal(isMcpTool('mcp__srv__t'), true);
+    assert.equal(isMcpTool('read_file'), false);
+    assert.equal(mcpNeedsApproval({ tool: 'mcp__srv__t', title: 'x' }), true);
+    assert.equal(mcpNeedsApproval({ tool: 'run_command', title: 'x', subject: 'ls' }), false);
+
+    const tools = readToolList({
+      tools: [
+        { name: 'ok', description: 'fine', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } },
+        { name: '', description: 'nameless' },
+        { name: 'no-schema' },
+        'garbage',
+      ],
+    });
+    assert.equal(tools.length, 2);
+    assert.equal(tools[0]?.name, 'ok');
+    assert.deepEqual(tools[1]?.inputSchema, { type: 'object', properties: {} });
+
+    assert.equal(
+      flattenContent([
+        { type: 'text', text: 'one' },
+        { type: 'image', mimeType: 'image/png' },
+        { type: 'resource', resource: { uri: 'file:///a.md', text: 'two' } },
+        { type: 'text', text: '' },
+      ]),
+      ['one', '[image content omitted: Kiro cannot display images]', 'file:///a.md\ntwo'].join('\n'),
+    );
+    assert.equal(flattenContent('plain string'), 'plain string');
+    assert.equal(flattenContent(undefined), '');
+
+    const entry = { type: 'http' as const, url: 'https://example.com/mcp' };
+    assert.match(mcpEntryProblem(entry) ?? '', /HTTP servers/);
+    assert.match(mcpEntryProblem({ disabled: true }) ?? '', /disabled/);
+    assert.match(mcpEntryProblem({ command: '' }) ?? '', /command/);
+    assert.equal(mcpEntryProblem({ command: 'node' }), null);
+  });
+
+  await test('MCP config merges project and user files with the project winning', async () => {
+    const dir = await tempDir('kiro-mcp-config-');
+    const home = path.join(dir, 'home');
+    const project = path.join(dir, 'project');
+    await mkdir(path.join(project, '.kiro'), { recursive: true });
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    try {
+      await writeFile(
+        path.join(home, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            shared: { command: 'user-command' },
+            onlyUser: { command: 'node', args: ['x.js'], env: { TOKEN: '${MY_TOKEN}' } },
+          },
+        }),
+        'utf8',
+      );
+      await writeFile(
+        path.join(project, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            shared: { command: 'project-command', disabled: true },
+            remote: { url: 'https://example.com/mcp', headers: { 'x-key': 'k' } },
+          },
+        }),
+        'utf8',
+      );
+
+      const loaded = await loadMcpConfig(project, home);
+      assert.deepEqual(Object.keys(loaded.servers).sort(), ['onlyUser', 'remote', 'shared']);
+      assert.equal(loaded.servers.shared?.command, 'project-command', 'the project file wins');
+      assert.equal(loaded.servers.shared?.disabled, true);
+      assert.equal(loaded.servers.remote?.type, 'http');
+      assert.deepEqual(loaded.servers.onlyUser?.args, ['x.js']);
+      assert.equal(loaded.problems.length, 0);
+      assert.equal(loaded.sources.length, 2);
+
+      await writeFile(path.join(project, '.kiro', 'mcp.json'), '{ broken', 'utf8');
+      const broken = await loadMcpConfig(project, home);
+      assert.equal(broken.servers.shared?.command, 'user-command', 'the user file still loads');
+      assert.match(broken.problems[0] ?? '', /not valid JSON/);
+
+      const single = await readMcpFile(path.join(dir, 'missing.json'));
+      assert.deepEqual(single, { servers: {} });
+
+      await writeFile(path.join(project, '.kiro', 'mcp.json'), JSON.stringify({ nope: true }), 'utf8');
+      assert.match((await readMcpFile(path.join(project, '.kiro', 'mcp.json'))).problem ?? '', /mcpServers/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('MCP servers start over stdio, list tools, and report failures', async () => {
+    const dir = await tempDir('kiro-mcp-run-');
+    const home = path.join(dir, 'home');
+    await mkdir(path.join(dir, '.kiro'), { recursive: true });
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    const serverPath = path.join(process.cwd(), 'test', 'mcp-server.ts');
+    const tsx = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    try {
+      await writeFile(
+        path.join(dir, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            demo: { command: process.execPath, args: [tsx, serverPath] },
+            broken: { command: path.join(dir, 'does-not-exist') },
+            off: { command: 'node', disabled: true },
+            web: { url: 'https://example.com/mcp' },
+          },
+        }),
+        'utf8',
+      );
+      const notices: string[] = [];
+      const setup = await setupMcp(dir, { home, onNotice: (message) => notices.push(message) });
+      try {
+        const states = Object.fromEntries(setup.statuses.map((status) => [status.name, status.state]));
+        assert.equal(states.demo, 'ready');
+        assert.equal(states.broken, 'error');
+        assert.equal(states.off, 'skipped');
+        assert.equal(states.web, 'skipped');
+
+        const demo = setup.statuses.find((status) => status.name === 'demo');
+        assert.equal(demo?.tools, 3);
+        assert.equal(demo?.transport, 'builtin');
+        assert.match(demo?.detail ?? '', /kiro-test-server 1\.2\.3/);
+        assert.ok(
+          notices.some((message) => /non-JSON output: mcp-server starting/.test(message)),
+          'a banner on stdout is reported, not treated as a protocol error',
+        );
+
+        const names = setup.definitions.map((definition) => definition.function.name).sort();
+        assert.deepEqual(names, [
+          'mcp__demo__fail_tool',
+          'mcp__demo__lookup_time',
+          'mcp__demo__rich_content',
+        ]);
+        const lookup = setup.definitions.find((definition) => definition.function.name === 'mcp__demo__lookup_time');
+        assert.deepEqual(lookup?.function.parameters.required, ['zone']);
+        assert.match(lookup?.function.description ?? '', /read-only/);
+        assert.match(lookup?.function.description ?? '', /Requires user approval/);
+
+        // Tools run through the registry and always ask first.
+        setExtraTools(setup.tools);
+        assert.equal(allTools().some((tool) => tool.mcp === true), true);
+        assert.ok(allToolDefinitions().some((definition) => definition.function.name === 'mcp__demo__lookup_time'));
+
+        const requests: ApprovalRequest[] = [];
+        const ctx = {
+          cwd: dir,
+          signal: new AbortController().signal,
+          approve: async (request: ApprovalRequest) => {
+            requests.push(request);
+            return 'allow' as const;
+          },
+        };
+        const result = await executeTool(
+          'mcp__demo__lookup_time',
+          JSON.stringify({ zone: 'Cilacap' }),
+          ctx,
+        );
+        assert.equal(result.status, 'ok');
+        assert.match(result.content, /2026-01-01T00:00:00 Cilacap/);
+        assert.equal(requests[0]?.tool, 'mcp__demo__lookup_time');
+        assert.equal(requests[0]?.subject, undefined, 'no subject means no rule can pre-approve it');
+        assert.match(requests[0]?.warning ?? '', /outside Kiro's file sandbox|runs inside the MCP server/);
+        assert.match(requests[0]?.detail ?? '', /Cilacap/);
+
+        const rich = await executeTool('mcp__demo__rich_content', '{}', ctx);
+        assert.match(rich.content, /first block/);
+        assert.match(rich.content, /image content omitted/);
+        assert.match(rich.content, /file:\/\/\/notes\.md/);
+
+        const failed = await executeTool('mcp__demo__fail_tool', '{}', ctx);
+        assert.equal(failed.status, 'error');
+        assert.match(failed.content, /the tool refused/);
+
+        const denied = await executeTool('mcp__demo__lookup_time', '{"zone":"x"}', {
+          ...ctx,
+          approve: async () => 'deny' as const,
+        });
+        assert.equal(denied.status, 'denied');
+
+        const unknown = await executeTool('mcp__demo__nope', '{}', ctx);
+        assert.match(unknown.content, /Unknown tool/);
+
+        const status = formatMcpStatus(setup, dir);
+        assert.match(status, /ok\s+demo \(3 tools\)/);
+        assert.match(status, /fail\s+broken/);
+        assert.match(status, /skip\s+off/);
+        assert.match(status, /Read from:/);
+      } finally {
+        await setup.close();
+        setExtraTools([]);
+      }
+
+      // A server that prints nothing at all still answers the handshake.
+      const quiet = await connectStdio('quiet', {
+        command: process.execPath,
+        args: [tsx, serverPath],
+        env: { MCP_BANNER: '0' },
+      });
+      try {
+        assert.equal(quiet.serverName, 'quiet');
+        assert.equal((await quiet.listTools()).length, 3);
+      } finally {
+        await quiet.close();
+      }
+
+      assert.equal(formatMcpStatus(null), 'MCP is off for this run.');
+      assert.match(
+        formatMcpStatus({ tools: [], definitions: [], statuses: [], config: { servers: {}, sources: [], problems: [] }, close: async () => {} }),
+        /No MCP servers configured/,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('a broken MCP server is skipped instead of blocking the session', async () => {
+    const dir = await tempDir('kiro-mcp-broken-');
+    const home = path.join(dir, 'home');
+    await mkdir(path.join(dir, '.kiro'), { recursive: true });
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    try {
+      await writeFile(
+        path.join(dir, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            exits: { command: process.execPath, args: ['-e', 'process.exit(3)'] },
+            silent: { command: process.execPath, args: ['-e', 'setTimeout(() => {}, 60000)'] },
+          },
+        }),
+        'utf8',
+      );
+      const setup = await setupMcp(dir, { home });
+      try {
+        assert.equal(setup.tools.length, 0);
+        for (const status of setup.statuses) {
+          assert.equal(status.state, 'error');
+          assert.ok((status.detail ?? '').length > 0);
+        }
+        const exiting = setup.statuses.find((status) => status.name === 'exits');
+        assert.match(exiting?.detail ?? '', /exited with code 3|closed|timed out/);
+      } finally {
+        await setup.close();
+      }
+
+      // An MCP tool name never collides with a built-in one.
+      const setup2 = await setupMcp(dir, { home: path.join(dir, 'empty-home') });
+      assert.equal(setup2.tools.length, 0);
+      await setup2.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('run_command streams its newest output line and keeps the full result', async () => {
+    const dir = await tempDir('kiro-live-output-');
+    try {
+      const turns: MockTurn[] = [
+        {
+          type: 'tool-calls',
+          calls: [
+            {
+              name: 'run_command',
+              arguments: {
+                command: "printf 'first\\nsecond\\n'; printf 'oops\\n' 1>&2",
+                timeout_seconds: 30,
+              },
+            },
+          ],
+          usage: { prompt_tokens: 20, completion_tokens: 10 },
+        },
+        { type: 'text', text: 'Finished.' },
+      ];
+      const scenario = await runScenario({ cwd: dir, turns });
+      try {
+        const live = scenario.events.filter(
+          (event): event is Extract<AgentEvent, { type: 'tool-output' }> =>
+            event.type === 'tool-output',
+        );
+        assert.ok(live.length > 0, 'a command with output emits live updates');
+        assert.ok(
+          live.every((event) => event.tail.length <= 400),
+          'the live tail stays short',
+        );
+        assert.ok(
+          live.some((event) => /oops/.test(event.tail)),
+          'stderr is streamed too',
+        );
+        assert.equal(live.at(-1)?.toolCall.function.name, 'run_command');
+
+        const end = toolEnds(scenario.events)[0];
+        assert.match(end?.result.content ?? '', /first\nsecond/, 'stdout is still in the result');
+        assert.match(end?.result.content ?? '', /\[stderr\]\noops/);
+        // Live updates must not leak into the conversation the model sees.
+        const toolMessage = scenario.messages.find((message) => message.role === 'tool');
+        assert.match(toolMessage?.content ?? '', /exit code: 0/);
+        assert.ok(!(toolMessage?.content ?? '').includes('live'));
+      } finally {
+        await scenario.mock.close();
+      }
+
+      // A read-only tool never streams, and a silent command simply emits nothing.
+      const silent = await createMockServer({
+        turns: [
+          {
+            type: 'tool-calls',
+            calls: [{ name: 'run_command', arguments: { command: 'true' } }],
+          },
+          { type: 'text', text: 'ok' },
+        ],
+      });
+      try {
+        const spy = approvalSpy('allow');
+        const quiet = await collect(
+          runAgentTurn({
+            provider: makeProvider(silent.url),
+            messages: [
+              { role: 'system', content: 'test' },
+              { role: 'user', content: 'run it' },
+            ],
+            ctx: { cwd: dir, signal: new AbortController().signal, approve: spy.fn },
+          }),
+        );
+        assert.equal(
+          quiet.filter((event) => event.type === 'tool-output').length,
+          0,
+          'no output means no live events',
+        );
+      } finally {
+        await silent.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('the transcript and status bar show the live line while a command runs', async () => {
+    const running: ViewItem = {
+      kind: 'tool',
+      id: 1,
+      callId: 'call-1',
+      name: 'run_command',
+      argsSummary: 'pnpm build',
+      status: 'running',
+      liveTail: 'Compiling src/app.tsx',
+    };
+    const rendered = buildLines([running], 80)
+      .map((line) => `${line.prefix}${line.text}${line.suffix ? line.suffix.text : ''}`)
+      .join('\n');
+    assert.match(rendered, /Compiling src\/app\.tsx/);
+    assert.match(rendered, /running…/, 'the spinner state is still labelled');
+
+    const noTail = buildLines([{ ...running, liveTail: undefined }], 80)
+      .map((line) => `${line.prefix}${line.text}`)
+      .join('\n');
+    assert.doesNotMatch(noTail, /Compiling/);
+
+    const status = renderToString(
+      React.createElement(StatusBar, {
+        width: 100,
+        profile: 'openai',
+        model: 'gpt-4.1',
+        cwd: '/tmp/project',
+        activity: 'running',
+        toolName: 'run_command',
+        liveTail: 'Compiling src/app.tsx',
+      }),
+      { columns: 100 },
+    );
+    assert.match(status, /Compiling src\/app\.tsx/);
+    assert.doesNotMatch(status, /running run_command/, 'the output line replaces the tool label');
+
+    const idle = renderToString(
+      React.createElement(StatusBar, {
+        width: 100,
+        profile: 'openai',
+        model: 'gpt-4.1',
+        cwd: '/tmp/project',
+        activity: null,
+        liveTail: 'stale line',
+      }),
+      { columns: 100 },
+    );
+    assert.doesNotMatch(idle, /stale line/, 'an idle bar ignores a leftover tail');
+  });
+
   await test('approval rules allow narrow patterns and always deny a chain', async () => {
     const dir = await tempDir('kiro-rules-');
     try {
@@ -2744,6 +3195,7 @@ async function main(): Promise<void> {
     );
     assert.deepEqual(filterSlashCommands('/m').map((command) => command.name), [
       '/model',
+      '/mcp',
       '/mouse',
     ]);
     assert.deepEqual(filterSlashCommands('/ex').map((command) => command.name), [

@@ -10,6 +10,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', description: 'show this help' },
   { name: '/model', usage: '[name | add | edit | remove | test | list]', description: 'list or switch models' },
   { name: '/skills', description: 'list installed skills and where they were found' },
+  { name: '/mcp', description: 'list MCP servers, their tools, and any startup errors' },
   { name: '/skill', usage: '<name> [request]', description: 'load a skill and apply it to your next request' },
   { name: '/context', description: 'show approximate context usage' },
   { name: '/usage', description: 'show or hide the usage card' },

@@ -244,6 +244,7 @@ kiro [options]
   --no-mouse         Disable mouse reporting so plain click-drag selection works
   --no-alt-screen    Do not switch to the terminal's alternate screen
   --no-skills        Do not read skill folders at all (KIRO_NO_SKILLS=1 does the same)
+  --no-mcp           Do not start MCP servers (KIRO_NO_MCP=1 does the same)
   -h, --help         Show help
   -v, --version      Show version
 
@@ -318,6 +319,8 @@ On a TTY, Kiro uses the alternate screen. When it exits, through `/exit`, a doub
 
 Mouse reporting is on by default, so the wheel scrolls the transcript. Hold Shift while dragging to select text, or run `/mouse` (or start with `--no-mouse`) to restore plain click-drag selection and scroll with `PgUp`/`PgDn`.
 
+While `run_command` runs, the status bar shows its newest output line and the running tool call keeps a dim `⎿ …` tail under it, so a build or test run reports progress instead of an idle spinner. The live line is display only: the full output still arrives with the tool result, and headless runs never print it.
+
 Tool results are one-line summaries. `Ctrl+O` expands the latest result inline; `PgUp`/`PgDn` scroll it. `/export` writes the whole conversation, including full tool arguments and results, to a Markdown file.
 
 ### Slash commands
@@ -350,6 +353,7 @@ Tool results are one-line summaries. `Ctrl+O` expands the latest result inline; 
 | `/rules` | List saved rules in `.kiro/permissions.json`, numbered |
 | `/rules remove <n>` | Delete one saved rule |
 | `/rules clear` | Delete the rule file |
+| `/mcp` | Show configured MCP servers, their state, and their tools |
 | `/exit` | Quit |
 
 `/model` has two steps. The first lists profiles grouped by endpoint, with the active one marked `*`; `Enter` opens the models. The second lists stored model ids with the current one marked `*`; `Enter` applies it and saves the choice. On the model step, type to filter (all space-separated terms must match), `Esc` clears the query and then goes back, and `Ctrl+R` refetches `GET /models`. `Ctrl+C` closes the picker.
@@ -537,6 +541,46 @@ The index is rebuilt every turn, so edits to `SKILL.md` apply on the next messag
 - Model discovery and the connection test both time out after 10 seconds and can be cancelled.
 - Config saves are atomic and merge with the file on disk, so unknown fields survive. Invalid JSON can be backed up and replaced with a template.
 
+## MCP servers
+
+Kiro can start Model Context Protocol servers and offer their tools to the model. Servers are configured in JSON, one file per scope:
+
+1. `<cwd>/.kiro/mcp.json` for the project
+2. `~/.kiro/mcp.json` for your machine
+
+The project file wins when both define the same name. The shape matches the file other MCP clients use, so it can be copied in unchanged:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "disabled-example": {
+      "command": "node",
+      "args": ["server.js"],
+      "disabled": true
+    }
+  }
+}
+```
+
+Only `stdio` servers are started. A server entry with a `url` (streamable HTTP) and an entry marked `disabled` are listed by `/mcp` and reported at startup, but Kiro does not connect to them. Set `KIRO_MCP_CONFIG` to load a different file instead of the two defaults.
+
+Server names and tool names become one tool name, `mcp__<server>__<tool>`, so two servers can offer the same tool. `/mcp` prints every server with its state, its tool count, and where the config came from.
+
+A few rules keep MCP predictable:
+
+- Every MCP tool call asks for approval, even under a session `[a]` allow, and saved rules cannot pre-approve one because the request has no rule subject. A server runs outside the workspace sandbox, so a rule that matches a command or a path does not describe it.
+- A server that fails to start is reported once and skipped. The rest of the session runs normally, and a server that prints non-JSON lines (a banner, a log line) produces a notice instead of an error.
+- The server inherits the environment Kiro runs with, minus stored credentials, plus any `env` in its entry. `${VAR}` inside a value is expanded from the environment.
+- Tool output is flattened to text: text and resource contents are kept, and image or audio blocks become a placeholder.
+- `--no-mcp` (or `KIRO_NO_MCP=1`) starts nothing. `KIRO_MCP_CONNECT_MS` sets the handshake timeout (default 15000) and `KIRO_MCP_TIMEOUT_MS` the timeout for a `tools/call` (default 30000).
+
+MCP tools are always treated as unsafe: no parallel batch, always an approval prompt. The protocol is JSON-RPC 2.0 over stdio, one JSON object per line.
+
 ## Testing
 
 ```bash
@@ -559,12 +603,14 @@ src/
   secrets.ts         credential registry: redaction and child-process env filtering
   sessions.ts        atomic session save/load/list
   model/             presets, discovery/test, context-window inference, shared wizard, CLI + screen renderer
+  mcp/               MCP config, JSON-RPC channel, stdio client, tool registry
   providers/         Provider interface, OpenAI-compatible implementation
   agent/             system prompt, skill discovery/parsing, agent loop, token estimates, compaction
   tools/             tool registry, fs/search/patch/shell/skill tools, checkpoints, glob/gitignore matching
   ui/                Ink app, markdown, command palette, prompt history, scrolling, approvals, status bar, export
 test/
   mock-server.ts     scripted OpenAI-compatible SSE server + /models variants
+  mcp-server.ts      small stdio MCP server used by the tests
   e2e.ts             backend test suite
 ```
 
@@ -574,7 +620,9 @@ test/
 - Model discovery assumes an OpenAI-compatible `GET /models`. Endpoints without it work, but the model id must be typed manually.
 - `@` lists files only and stops at 50,000 paths; directories and ignored files are not offered.
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
-- No sub-agents, MCP, plugins, web search, image input, themes, or git integration.
+- No sub-agents, plugins, web search, image input, themes, or git integration.
+- MCP support covers `stdio` servers only. Streamable-HTTP servers are read from the config file and reported as skipped.
+- The live output line shows the newest line only, capped at 400 characters; earlier lines arrive with the tool result.
 - Approval rules match a glob, not a shell grammar: a rule for `npm test*` also covers `npm test-evil`. Review saved rules with `/rules` when a project's rules come from someone else.
 - The cost estimate uses a built-in list-price table that ages; `/context` names the price it used, and `pricing` in the profile overrides it.
 - Sessions are single-process and stored as plaintext JSON. There is no delete or rename command. The `/resume` picker can load a session from another directory and switches the working directory to it; `/export` writes a Markdown transcript you can keep.
