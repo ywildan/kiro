@@ -9,6 +9,7 @@ import type {
   ToolCall,
   ToolDefinition,
 } from './types.js';
+import { chatEndpoint, requestHeaders } from './request.js';
 import { ProviderError } from './types.js';
 
 const MAX_RETRIES = 3;
@@ -18,11 +19,6 @@ const DEFAULT_STREAM_IDLE_MS = 120_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function endpointFor(baseUrl: string): string {
-  const trimmed = baseUrl.replace(/\/+$/, '');
-  return trimmed.endsWith('/chat/completions') ? trimmed : `${trimmed}/chat/completions`;
 }
 
 function extractText(content: unknown): string {
@@ -156,6 +152,7 @@ function finalizeToolCalls(calls: Map<number, PendingToolCall>): ToolCall[] {
 export class OpenAIProvider implements Provider {
   readonly type = 'openai';
   readonly model: string;
+  private readonly profile: ProfileConfig;
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
   private readonly temperature: number | undefined;
@@ -168,6 +165,7 @@ export class OpenAIProvider implements Provider {
   private completionTokenStyle: 'chat' | 'completion';
 
   constructor(profile: ProfileConfig, apiKey: string | undefined) {
+    this.profile = profile;
     this.baseUrl = profile.baseUrl;
     this.model = profile.model;
     this.apiKey = apiKey;
@@ -181,7 +179,7 @@ export class OpenAIProvider implements Provider {
     tools: ToolDefinition[],
     options: StreamOptions = {},
   ): AsyncIterable<ProviderEvent> {
-    const endpoint = endpointFor(this.baseUrl);
+    const endpoint = chatEndpoint(this.baseUrl);
     let url: URL;
     try {
       url = new URL(endpoint);
@@ -190,10 +188,10 @@ export class OpenAIProvider implements Provider {
     }
 
     const headers: Record<string, string> = {
+      ...requestHeaders(this.profile, this.apiKey),
       'Content-Type': 'application/json',
       Accept: 'text/event-stream, application/json',
     };
-    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
 
     const body: Record<string, unknown> = {
       model: this.model,

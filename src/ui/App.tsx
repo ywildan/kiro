@@ -409,7 +409,11 @@ export function App({
       if (profile.apiKeyEnv && !key) {
         return { ok: false, message: `API key is missing: $${profile.apiKeyEnv} is not set.` };
       }
-      const result = await discoverModels({ baseUrl: profile.baseUrl, apiKey: key });
+      const result = await discoverModels({
+        baseUrl: profile.baseUrl,
+        apiKey: key,
+        headers: profile.headers,
+      });
       if (!result.ok) return { ok: false, message: result.message };
       if (result.models.length === 0) {
         return { ok: false, message: 'The endpoint returned an empty model list.' };
@@ -1033,7 +1037,11 @@ export function App({
         return;
       }
       addNotice('muted', `Fetching models from ${profile.baseUrl}…`);
-      const result = await discoverModels({ baseUrl: profile.baseUrl, apiKey: key });
+      const result = await discoverModels({
+        baseUrl: profile.baseUrl,
+        apiKey: key,
+        headers: profile.headers,
+      });
       if (!result.ok) {
         addNotice('error', result.message);
         return;

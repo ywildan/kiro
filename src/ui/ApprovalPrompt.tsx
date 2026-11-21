@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text, useInput } from 'ink';
 import type { ApprovalRequest, ApprovalDecision } from '../tools/types.js';
+import { MAX_PREVIEW_LINES, windowPreview } from './approval-preview.js';
 import { sanitizeText, truncateToWidth, wrapPlain } from './text.js';
 
 interface ApprovalPromptProps {
@@ -9,7 +10,12 @@ interface ApprovalPromptProps {
   onDecision(decision: ApprovalDecision): void;
 }
 
-const MAX_PREVIEW_LINES = 5;
+function lineColor(line: string): string | undefined {
+  if (line.startsWith('+')) return 'green';
+  if (line.startsWith('-')) return 'red';
+  if (line.startsWith('@@')) return 'cyan';
+  return undefined;
+}
 
 export function ApprovalPrompt({ request, width, onDecision }: ApprovalPromptProps): React.JSX.Element {
   useInput((input, key) => {
@@ -19,24 +25,16 @@ export function ApprovalPrompt({ request, width, onDecision }: ApprovalPromptPro
   });
 
   const innerWidth = Math.max(10, width - 4);
-  const rawDetail = sanitizeText(request.detail ?? '').split('\n');
-  let previewLines: string[];
-  let truncated: boolean;
-  if (request.tool === 'run_command') {
-    const wrapped = rawDetail.flatMap((line) => wrapPlain(line, innerWidth));
-    previewLines = wrapped.slice(0, MAX_PREVIEW_LINES);
-    truncated = wrapped.length > MAX_PREVIEW_LINES;
-  } else {
-    previewLines = rawDetail
-      .slice(0, MAX_PREVIEW_LINES)
-      .map((line) => truncateToWidth(line, innerWidth));
-    truncated = rawDetail.length > MAX_PREVIEW_LINES;
-  }
-  if (truncated && previewLines.length > 0) {
-    const last = previewLines.length - 1;
-    previewLines[last] = `${truncateToWidth(previewLines[last] ?? '', innerWidth - 2)} …`;
-  }
-  if (previewLines.length === 0) previewLines = ['(no preview)'];
+  const detail = sanitizeText(request.detail ?? '').trimEnd();
+  const rawDetail = detail ? detail.split('\n') : [];
+  // Commands are wrapped so a long line does not hide the rest of the script;
+  // diffs are clipped, since a wrapped diff row reads as a different change.
+  const fitted =
+    request.tool === 'run_command'
+      ? rawDetail.flatMap((line) => wrapPlain(line, innerWidth))
+      : rawDetail.map((line) => truncateToWidth(line, innerWidth));
+  const previewLines =
+    fitted.length === 0 ? ['(no preview yet)'] : windowPreview(fitted, request.tool, MAX_PREVIEW_LINES);
 
   return (
     <Box
@@ -56,16 +54,7 @@ export function ApprovalPrompt({ request, width, onDecision }: ApprovalPromptPro
         </Text>
       ) : null}
       {previewLines.map((line, index) => {
-        const color =
-          request.tool !== 'run_command'
-            ? line.startsWith('+') && !line.startsWith('+++')
-              ? 'green'
-              : line.startsWith('-') && !line.startsWith('---')
-                ? 'red'
-                : line.startsWith('@@')
-                  ? 'cyan'
-                  : undefined
-            : undefined;
+        const color = request.tool === 'run_command' ? undefined : lineColor(line);
         return (
           <Text
             key={index}

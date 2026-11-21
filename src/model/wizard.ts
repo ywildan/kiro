@@ -1,6 +1,7 @@
 import {
   DEFAULT_CONTEXT_WINDOW,
   normalizeBaseUrl,
+  parseHeaderEntry,
   suggestProfileName,
   validateProfileName,
   type KiroConfig,
@@ -42,6 +43,7 @@ export interface WizardDependencies {
   discoverModels?: (options: {
     baseUrl: string;
     apiKey?: string;
+    headers?: Record<string, string>;
     signal?: AbortSignal;
   }) => Promise<DiscoveredModels>;
   testConnection?: (
@@ -297,6 +299,7 @@ async function editFields(
         key: 'contextWindow',
         label: `Context window (${current.contextWindow ?? DEFAULT_CONTEXT_WINDOW})`,
       },
+      { key: 'headers', label: `Extra request headers (${headerSummary(current)})` },
       { key: 'done', label: 'Done editing; test and save' },
     ]);
     if (field === null) return null;
@@ -408,8 +411,44 @@ async function editFields(
       });
       if (answer === null) return null;
       draft.profile = { ...draft.profile, contextWindow: Number(answer) };
+      continue;
+    }
+    if (field === 'headers') {
+      const answer = await ui.text({
+        label: 'Header as "Name: value" (Enter keeps; comma separates entries; "-" removes all)',
+        allowEmpty: true,
+        mask: false,
+      });
+      if (answer === null) return null;
+      const value = answer.trim();
+      if (!value) {
+        ui.note('muted', `Headers unchanged: ${headerSummary(current)}.`);
+        continue;
+      }
+      if (value === '-') {
+        draft.profile = { ...draft.profile, headers: undefined };
+        ui.note('muted', 'Custom headers removed.');
+        continue;
+      }
+      try {
+        const merged: Record<string, string> = { ...current.headers };
+        for (const entry of value.split(',')) {
+          const { name, value: headerValue } = parseHeaderEntry(entry);
+          merged[name] = headerValue;
+        }
+        draft.profile = { ...draft.profile, headers: merged };
+        ui.note('muted', `Headers: ${headerSummary(draft.profile)}.`);
+      } catch (error) {
+        ui.note('error', (error as Error).message);
+      }
     }
   }
+}
+
+/** Header names only: values may hold a token, so the UI never prints them. */
+function headerSummary(profile: ProfileConfig): string {
+  const names = Object.keys(profile.headers ?? {});
+  return names.length > 0 ? names.join(', ') : 'none';
 }
 
 async function storePendingKey(
@@ -601,6 +640,25 @@ export async function runAddFlow(ctx: WizardContext): Promise<string | null> {
     contextWindow = Number(windowAnswer);
   }
 
+  const headerAnswer = await ui.text({
+    label: 'Extra request headers as "Name: value", comma separated (Enter to skip)',
+    allowEmpty: true,
+  });
+  if (headerAnswer === null) return cancel(ctx);
+  let headers: Record<string, string> | undefined;
+  if (headerAnswer.trim()) {
+    try {
+      headers = {};
+      for (const entry of headerAnswer.split(',')) {
+        const { name: headerName, value } = parseHeaderEntry(entry);
+        headers[headerName] = value;
+      }
+    } catch (error) {
+      ui.note('error', (error as Error).message);
+      ui.note('muted', 'The profile will be saved without custom headers.');
+    }
+  }
+
   const draft: Draft = {
     name,
     profile: {
@@ -612,6 +670,7 @@ export async function runAddFlow(ctx: WizardContext): Promise<string | null> {
       temperature,
       maxTokens,
       contextWindow,
+      headers,
     },
     pendingKey,
   };

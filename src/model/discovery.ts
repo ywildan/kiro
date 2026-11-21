@@ -1,5 +1,6 @@
 import type { ProfileConfig } from '../config.js';
 import { createProvider } from '../providers/index.js';
+import { endpointUrl, requestHeaders } from '../providers/request.js';
 import { ProviderError } from '../providers/types.js';
 import { formatDuration } from '../ui/text.js';
 
@@ -25,11 +26,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function modelsEndpoint(baseUrl: string): string {
-  const trimmed = baseUrl.trim().replace(/\/+$/, '');
-  const withoutChat = trimmed.endsWith('/chat/completions')
-    ? trimmed.slice(0, -'/chat/completions'.length).replace(/\/+$/, '')
-    : trimmed;
-  return `${withoutChat}/models`;
+  // A base that already names the chat endpoint maps back to its root.
+  const root = baseUrl.trim().replace(/\/chat\/completions\/?(?=$|[?#])/i, '');
+  return endpointUrl(root, 'models');
 }
 
 function snippet(text: string): string {
@@ -85,7 +84,7 @@ function readModelIds(parsed: unknown): string[] {
 }
 
 export async function discoverModels(
-  options: { baseUrl: string; apiKey?: string } & TimeoutOptions,
+  options: { baseUrl: string; apiKey?: string; headers?: Record<string, string> } & TimeoutOptions,
 ): Promise<DiscoveredModels> {
   const url = modelsEndpoint(options.baseUrl);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -98,8 +97,10 @@ export async function discoverModels(
   const onOuterAbort = (): void => controller.abort();
   options.signal?.addEventListener('abort', onOuterAbort, { once: true });
 
-  const headers: Record<string, string> = { Accept: 'application/json' };
-  if (options.apiKey) headers.Authorization = `Bearer ${options.apiKey}`;
+  const headers: Record<string, string> = {
+    ...requestHeaders({ type: 'openai', baseUrl: options.baseUrl, model: '', headers: options.headers }, options.apiKey),
+    Accept: 'application/json',
+  };
 
   try {
     const response = await fetch(url, { method: 'GET', headers, signal: controller.signal });

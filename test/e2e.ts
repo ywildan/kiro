@@ -47,6 +47,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   loadConfig,
   normalizeBaseUrl,
+  parseHeaderEntry,
   recoverConfig,
   resolveProfile,
   saveConfig,
@@ -55,6 +56,10 @@ import {
   validateProfileName,
   type KiroConfig,
 } from '../src/config.js';
+import { buildDiff } from '../src/tools/diff.js';
+import { chatEndpoint, endpointUrl, profileHeaders, requestHeaders } from '../src/providers/request.js';
+import { ApprovalPrompt } from '../src/ui/ApprovalPrompt.js';
+import { windowPreview } from '../src/ui/approval-preview.js';
 import {
   defaultKeyEnv,
   keyStatus,
@@ -2066,6 +2071,255 @@ async function main(): Promise<void> {
     }
   });
 
+
+  await test('an approval preview shows the changed lines instead of the diff header', async () => {
+    const before = Array.from({ length: 40 }, (_, index) => `  item${index}();`).join('\n');
+    for (const target of [1, 20, 38]) {
+      const after = before
+        .split('\n')
+        .map((line, index) => (index === target ? `  item${target}Changed();` : line))
+        .join('\n');
+      const diff = buildDiff('src/util.ts', before, after);
+      const rendered = renderToString(
+        React.createElement(ApprovalPrompt, {
+          request: { tool: 'edit_file', title: 'Edit src/util.ts', detail: diff.text },
+          width: 90,
+          onDecision: () => {},
+        }),
+        { columns: 90 },
+      );
+      assert.ok(
+        rendered.includes(`item${target}Changed`),
+        `the added line for change ${target} is visible:\n${rendered}`,
+      );
+      assert.ok(rendered.includes(`-  item${target}();`), 'the removed line is visible too');
+      assert.ok(!rendered.includes('--- a/src/util.ts'), 'the file header no longer eats the budget');
+    }
+
+    const command = ['set -e', 'echo "building"', 'pnpm install', 'pnpm build', 'rm -rf dist/cache'];
+    const rendered = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'run_command', title: 'Run command', detail: `$ ${command.join('\n')}` },
+        width: 80,
+        onDecision: () => {},
+      }),
+      { columns: 80 },
+    );
+    assert.ok(rendered.includes('set -e'), 'the start of a command stays visible');
+    assert.ok(rendered.includes('rm -rf dist/cache'), 'the destructive tail stays visible');
+
+    const many = Array.from({ length: 40 }, (_, index) => `line ${index}`);
+    const windowed = windowPreview(many, 'run_command', 6);
+    assert.equal(windowed.length, 6);
+    assert.match(windowed[3] ?? '', /hidden/, 'the hidden middle is counted');
+    assert.equal(windowed[0], 'line 0');
+    assert.equal(windowed[5], 'line 39');
+
+    const none = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'write_file', title: 'Create notes.md' },
+        width: 70,
+        onDecision: () => {},
+      }),
+      { columns: 70 },
+    );
+    assert.match(none, /no preview/);
+  });
+
+  await test('profile headers and query strings reach every request', async () => {
+    const mock = await createMockServer({
+      models: ['mock-alpha'],
+      turns: [{ type: 'text', text: 'OK' }],
+    });
+    try {
+      process.env.KIRO_TEST_ROUTING = 'team-blue';
+      const profile = {
+        type: 'openai',
+        baseUrl: `${mock.url}/v1?api-version=2024-10-21`,
+        model: 'mock-alpha',
+        headers: { 'x-routing': 'team-blue', 'x-token': '${KIRO_TEST_ROUTING}' },
+      };
+      assert.equal(
+        chatEndpoint(profile.baseUrl),
+        `${mock.url}/v1/chat/completions?api-version=2024-10-21`,
+        'the query string survives and the path is not duplicated',
+      );
+      assert.equal(
+        chatEndpoint(`${mock.url}/v1/chat/completions`),
+        `${mock.url}/v1/chat/completions`,
+        'a base that already names the endpoint is not doubled',
+      );
+      assert.equal(endpointUrl(`${mock.url}/v1`, 'models'), `${mock.url}/v1/models`);
+
+      const headers = profileHeaders(profile);
+      assert.equal(headers['x-routing'], 'team-blue');
+      assert.equal(headers['x-token'], 'team-blue', '${VAR} reads the environment');
+      delete process.env.KIRO_TEST_ROUTING;
+      assert.equal(
+        profileHeaders({ ...profile, headers: { 'x-token': '${KIRO_MISSING_VAR}' } })['x-token'],
+        '${KIRO_MISSING_VAR}',
+        'an unknown variable stays literal instead of becoming empty',
+      );
+
+      const reserved = profileHeaders({
+        ...profile,
+        headers: { authorization: 'Bearer x', 'content-type': 'text/plain', 'x-ok': '1' },
+      });
+      assert.deepEqual(reserved, { 'x-ok': '1' });
+      assert.deepEqual(requestHeaders({ ...profile, headers: {} }, 'key-123'), {
+        Authorization: 'Bearer key-123',
+      });
+      assert.deepEqual(
+      profileHeaders({ ...profile, headers: { Authorization: 'raw-key' } }),
+      {},
+      'Authorization cannot be set twice; the key belongs in apiKeyEnv',
+    );
+
+      const test = await testConnection(profile, 'key-123');
+      assert.equal(test.ok, true, test.message);
+      const sent = mock.requests[0];
+      assert.equal(sent?.headers['x-routing'], 'team-blue');
+      assert.equal(sent?.headers.authorization, 'Bearer key-123');
+
+      await discoverModels({ baseUrl: profile.baseUrl, apiKey: 'key-123', headers: profile.headers });
+      assert.equal(mock.modelRequests[0]?.headers['x-routing'], 'team-blue');
+      assert.match(mock.modelRequests[0]?.url ?? '', /api-version=2024-10-21/);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await test('config validates custom headers and saves them', async () => {
+    const dir = await tempDir('kiro-headers-');
+    const file = path.join(dir, 'config.json');
+    const previousConfig = process.env.KIRO_CONFIG_PATH;
+    process.env.KIRO_CONFIG_PATH = file;
+    try {
+      const base = {
+        type: 'openai',
+        baseUrl: 'https://api.example.com/v1',
+        model: 'm',
+        headers: { 'api-key': 'abc', 'x-team': 'infra' },
+      };
+      const config: KiroConfig = { activeProfile: 'p', profiles: { p: base } };
+      const validated = validateConfig(config);
+      assert.deepEqual(validated.profiles.p?.headers, { 'api-key': 'abc', 'x-team': 'infra' });
+      await saveConfig(config, { path: file });
+      const saved = JSON.parse(await readFile(file, 'utf8'));
+      assert.deepEqual(saved.profiles.p.headers, { 'api-key': 'abc', 'x-team': 'infra' });
+
+      const rerun = await loadConfig();
+      assert.deepEqual(rerun.config.profiles.p?.headers, { 'api-key': 'abc', 'x-team': 'infra' });
+
+      assert.throws(
+        () => validateConfig({ ...config, profiles: { p: { ...base, headers: { authorization: 'x' } } } }),
+        /set by Kiro/,
+      );
+      assert.throws(
+        () => validateConfig({ ...config, profiles: { p: { ...base, headers: { 'x-a': 'line\nbreak' } } } }),
+        /single-line/,
+      );
+      assert.throws(
+        () => validateConfig({ ...config, profiles: { p: { ...base, headers: 'nope' } } }),
+        /must be an object/,
+      );
+
+      assert.deepEqual(parseHeaderEntry('api-key: ${AZURE_KEY}'), {
+        name: 'api-key',
+        value: '${AZURE_KEY}',
+      });
+      assert.deepEqual(parseHeaderEntry('  x-team :infra  '), { name: 'x-team', value: 'infra' });
+      assert.throws(() => parseHeaderEntry('no-colon'), /Name: value/);
+      assert.throws(() => parseHeaderEntry('x-empty:'), /needs a value/);
+      assert.throws(() => parseHeaderEntry('bad name: v'), /not a valid header name/);
+    } finally {
+      if (previousConfig === undefined) delete process.env.KIRO_CONFIG_PATH;
+      else process.env.KIRO_CONFIG_PATH = previousConfig;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('scripted kiro model add accepts --header flags', async () => {
+    const dir = await tempDir('kiro-header-cli-');
+    const configFile = path.join(dir, 'config.json');
+    const envFile = path.join(dir, '.env');
+    const project = await tempDir('kiro-header-project-');
+    const previous = {
+      config: process.env.KIRO_CONFIG_PATH,
+      env: process.env.KIRO_ENV_PATH,
+    };
+    process.env.KIRO_CONFIG_PATH = configFile;
+    process.env.KIRO_ENV_PATH = envFile;
+    try {
+      const mock = await createMockServer({ models: ['mock-alpha'], turns: [{ type: 'text', text: 'OK' }] });
+      try {
+        const tsxCli = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+        const cliPath = path.join(process.cwd(), 'src', 'index.tsx');
+        const run = (args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> =>
+          new Promise((resolve, reject) => {
+            const child = spawn(process.execPath, [tsxCli, cliPath, ...args], {
+              cwd: project,
+              env: { ...process.env },
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout.setEncoding('utf8');
+            child.stderr.setEncoding('utf8');
+            child.stdout.on('data', (chunk: string) => (stdout += chunk));
+            child.stderr.on('data', (chunk: string) => (stderr += chunk));
+            child.on('error', reject);
+            child.on('close', (status) => resolve({ status, stdout, stderr }));
+          });
+
+        const added = await run([
+          'model',
+          'add',
+          '--name',
+          'routed',
+          '--base-url',
+          `${mock.url}/v1?api-version=1`,
+          '--model',
+          'mock-alpha',
+          '--header',
+          'x-team: infra',
+          '--header',
+          'x-version: v2',
+          '--set-active',
+        ]);
+        assert.equal(added.status, 0, added.stderr);
+        const saved = JSON.parse(await readFile(configFile, 'utf8'));
+        assert.deepEqual(saved.profiles.routed.headers, { 'x-team': 'infra', 'x-version': 'v2' });
+        assert.equal(saved.activeProfile, 'routed');
+        assert.equal(mock.requests.at(-1)?.headers['x-team'], 'infra');
+
+        const bad = await run([
+          'model',
+          'add',
+          '--name',
+          'bad',
+          '--base-url',
+          `${mock.url}/v1`,
+          '--model',
+          'mock-alpha',
+          '--header',
+          'authorization: x',
+          '--no-test',
+        ]);
+        assert.equal(bad.status, 2);
+        assert.match(bad.stderr, /set by Kiro/);
+      } finally {
+        await mock.close();
+      }
+    } finally {
+      if (previous.config === undefined) delete process.env.KIRO_CONFIG_PATH;
+      else process.env.KIRO_CONFIG_PATH = previous.config;
+      if (previous.env === undefined) delete process.env.KIRO_ENV_PATH;
+      else process.env.KIRO_ENV_PATH = previous.env;
+      await rm(dir, { recursive: true, force: true });
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
   await test('approval policy tracks session allowances and yolo', async () => {
     const policy = new ApprovalPolicy(false);
     assert.equal(policy.isAuto('run_command'), false);
@@ -2946,6 +3200,7 @@ async function main(): Promise<void> {
         'sk-wizard-secret-1234',
         '1',
         'wizard-model',
+        '', // no extra request headers
         'n',
         'y',
       ]);
@@ -2963,7 +3218,7 @@ async function main(): Promise<void> {
       await assertPrivateMode(envFile, 0o600);
       assert.ok(!(await readFile(configFile, 'utf8')).includes('sk-wizard-secret'));
 
-      const editUi = new ScriptedUi(['3', 'wizard-changed', '8', '64000', '9']);
+      const editUi = new ScriptedUi(['3', 'wizard-changed', '8', '64000', '10']);
       const editCtx = {
         ui: editUi,
         config: addCtx.config,
@@ -3011,6 +3266,7 @@ async function main(): Promise<void> {
         '',
         'manual-model',
         'manual-profile',
+        '', // no extra request headers
         'n',
         'n',
       ]);

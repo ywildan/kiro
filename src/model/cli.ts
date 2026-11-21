@@ -2,6 +2,7 @@ import {
   configPath,
   loadConfig,
   normalizeBaseUrl,
+  parseHeaderEntry,
   recoverConfig,
   saveConfig,
   validateProfileName,
@@ -40,6 +41,7 @@ Add options:
   --api-key <key>       store a new key in ~/.kiro/.env (never in config.json)
   --temperature <n>     sampling temperature (default 0.2)
   --max-tokens <n>      response limit (default 4096)
+  --header <name:value> extra request header (repeatable; value may use \${VAR})
   --set-active          make the new profile active
   --no-test             skip the connection test
   -h, --help            show this help
@@ -51,10 +53,13 @@ Keys live in ${envPath()} (mode 0600); config.json only stores the variable name
 interface FlagSpec {
   value: Set<string>;
   boolean: Set<string>;
+  repeated?: Set<string>;
 }
 
 interface ParsedFlags {
   values: Map<string, string>;
+  /** Flags that may appear more than once, in order. */
+  repeated: Map<string, string[]>;
   booleans: Set<string>;
   positionals: string[];
   help: boolean;
@@ -63,6 +68,7 @@ interface ParsedFlags {
 function parseFlags(argv: string[], spec: FlagSpec): ParsedFlags {
   const parsed: ParsedFlags = {
     values: new Map(),
+    repeated: new Map(),
     booleans: new Set(),
     positionals: [],
     help: false,
@@ -88,7 +94,9 @@ function parseFlags(argv: string[], spec: FlagSpec): ParsedFlags {
       parsed.booleans.add(flag);
       continue;
     }
-    if (!spec.value.has(flag)) throw new ModelCliError(`Unknown option: ${flag}`, 2);
+    if (!spec.value.has(flag) && !spec.repeated?.has(flag)) {
+      throw new ModelCliError(`Unknown option: ${flag}`, 2);
+    }
     let value: string | undefined;
     if (equals !== -1) {
       value = arg.slice(equals + 1);
@@ -100,6 +108,12 @@ function parseFlags(argv: string[], spec: FlagSpec): ParsedFlags {
       }
     }
     if (!value) throw new ModelCliError(`Option ${flag} requires a value.`, 2);
+    if (spec.repeated?.has(flag)) {
+      const list = parsed.repeated.get(flag) ?? [];
+      list.push(value);
+      parsed.repeated.set(flag, list);
+      continue;
+    }
     parsed.values.set(flag, value);
   }
   return parsed;
@@ -165,8 +179,10 @@ async function loadConfigForCommand(interactive: boolean): Promise<{
 
 function printProfile(key: string, profile: ProfileConfig, active: boolean): void {
   const marker = active ? '*' : ' ';
+  const headers = Object.keys(profile.headers ?? {});
+  const headerNote = headers.length > 0 ? `  headers: ${headers.join(',')}` : '';
   console.log(
-    `${marker} ${key}  ${profile.model}  ${profile.baseUrl}  (${keyStatus(profile)})`,
+    `${marker} ${key}  ${profile.model}  ${profile.baseUrl}  (${keyStatus(profile)})${headerNote}`,
   );
 }
 
@@ -196,6 +212,7 @@ async function runAdd(argv: string[]): Promise<number> {
       '--max-tokens',
     ]),
     boolean: new Set(['--set-active', '--no-test']),
+    repeated: new Set(['--header']),
   };
   const parsed = parseFlags(argv, spec);
   if (parsed.help) {
@@ -205,7 +222,7 @@ async function runAdd(argv: string[]): Promise<number> {
   if (parsed.positionals.length > 0) {
     usageError(`Unexpected argument: ${parsed.positionals[0]}`);
   }
-  if (parsed.values.size === 0 && parsed.booleans.size === 0) {
+  if (parsed.values.size === 0 && parsed.booleans.size === 0 && parsed.repeated.size === 0) {
     const loaded = await loadConfigForCommand(true);
     const ui = new CliModelUi();
     const ctx: WizardContext = {
@@ -244,6 +261,16 @@ async function runAdd(argv: string[]): Promise<number> {
     );
   }
 
+  let headers: Record<string, string> | undefined;
+  for (const entry of parsed.repeated.get('--header') ?? []) {
+    try {
+      const { name: headerName, value } = parseHeaderEntry(entry);
+      headers = { ...headers, [headerName]: value };
+    } catch (error) {
+      usageError((error as Error).message);
+    }
+  }
+
   const profile: ProfileConfig = {
     type: 'openai',
     baseUrl,
@@ -251,6 +278,7 @@ async function runAdd(argv: string[]): Promise<number> {
     model,
     temperature,
     maxTokens,
+    headers,
   };
 
   if (envName && !keyValue && !process.env[envName]) {

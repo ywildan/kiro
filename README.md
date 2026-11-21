@@ -100,7 +100,8 @@ kiro model test [name]                      # small chat completion, reports lat
 
 kiro model add --name <name> --base-url <url> --model <id> \
   [--api-key-env <VAR>] [--api-key <key>] \
-  [--temperature <0-2>] [--max-tokens <n>] [--set-active] [--no-test]
+  [--temperature <0-2>] [--max-tokens <n>] [--header <name:value>]...
+  [--set-active] [--no-test]
 ```
 
 `--flag=value` also works. `add` validates the URL, name, model, and numbers before saving, and a failed connection test saves nothing (use `--no-test` to skip it). Success exits `0`; validation, network, and test failures exit non-zero with a message on stderr.
@@ -110,6 +111,7 @@ Keys for `kiro model add`:
 - `--api-key <key>` writes the key to `~/.kiro/.env` under `--api-key-env`, or under a generated `KIRO_<PROFILE>_API_KEY`.
 - `--api-key-env <VAR>` stores nothing; the variable must already exist in the environment or in `~/.kiro/.env`.
 - With neither flag, the profile has no key, which is fine for local servers.
+- `--header "Name: value"` adds a request header and can repeat. The value may use `${VAR}` to read the environment, so a gateway token stays out of `config.json`. `Authorization`, `Content-Type`, and the other headers Kiro sends are refused; use `apiKeyEnv` for the key.
 
 ### Updates
 
@@ -184,6 +186,7 @@ Set `KIRO_ENV_PATH` to use a different `.env` file.
 | `temperature` | no | Sampling temperature. |
 | `maxTokens` | no | Maximum response tokens. |
 | `contextWindow` | no | Approximate context window in tokens, at least 1000. Defaults to `128000`; drives the ctx meter and compaction. |
+| `headers` | no | Extra request headers, for gateways that need a routing or API-version header. Values may use `${VAR}`. `Authorization` and the other headers Kiro sends are rejected. |
 
 `activeProfile` selects the profile used at startup. `/model <name>` switches at runtime and `--profile` switches for one run.
 
@@ -409,6 +412,8 @@ Approvals show a diff, or the exact command, and offer:
 - `[a]` allow this tool for the rest of the session (the status bar shows `auto:<tool>`; `/allow clear` revokes it)
 - `[n]` deny and return the refusal to the model
 
+The preview keeps six rows. A diff drops its `---`/`+++` file headers and window markers so the changed lines fit, and a long command keeps both ends, since a destructive step is often the last line. A preview that still does not fit ends with a count of the hidden rows.
+
 Paths resolve against the working directory. Symlinks and `..` escapes are caught with `realpath`: reads, listings, and searches outside the workspace are refused, while writes, edits, and patches outside it need an explicit approval warning. `run_command` times out after 60 seconds by default (maximum 600), kills the process group on timeout or cancel, and truncates output to about 20k characters, keeping the head and tail. `read_file` returns 400 lines by default (maximum 2000) and points at the next offset. `glob` and `grep` honour `.gitignore`, always skip `node_modules`, `.git`, `dist`, and `build`, and cap their output with a hint on narrowing the search. Every tool result is also capped at 60k characters.
 
 Read-only tools (`read_file`, `list_dir`, `glob`, `grep`) in one response run in parallel, and results are appended in call order. A write, edit, patch, or command breaks the batch and runs with an approval prompt.
@@ -478,7 +483,7 @@ pnpm mock    # mock server on port 8787 for manual TUI testing
 
 The mock server streams scripted replies with tool calls, slow responses, and errors, and can force `401`/`404`, custom headers, or a dropped connection. Point a profile at `http://localhost:8787/v1` with any model name; no key is needed.
 
-The tests cover streaming and tool calls, approvals, retries and timeouts, path escapes, search and edit behaviour, config and key handling, compaction, sessions, the TUI components, and the skills pipeline from `SKILL.md` to `read_skill`. Pty runs exercise the palette, scrolling, Markdown, approvals, cancellation, and the `/usage` toggle. Model workflow tests use a temporary `$HOME`, so the real `~/.kiro` is never touched.
+The tests cover streaming and tool calls, approvals, retries and timeouts, path escapes, search and edit behaviour, config and key handling, compaction, sessions, the TUI components, and the skills pipeline from `SKILL.md` to `read_skill`. Ink components are rendered with `renderToString`, so layouts are checked as text, not through a terminal. Palette, scrolling, Markdown, approvals, cancellation, and the `/usage` toggle are covered this way. Model workflow tests use a temporary `$HOME`, so the real `~/.kiro` is never touched.
 
 ## Project layout
 
