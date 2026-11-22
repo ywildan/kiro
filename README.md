@@ -250,6 +250,7 @@ kiro [options]
 
   kiro check         Compare the installed version with the latest on npm
   kiro update        Install the latest version from npm globally
+  kiro mcp [command] List, add, or remove MCP servers
   kiro doctor        Check Node, config, key storage, and the active endpoint
 ```
 
@@ -294,6 +295,8 @@ Exit codes: `0` success, `1` model/tool/session error, `2` usage error, `130` ca
 The input grows to six rows and scrolls with the cursor. Text pasted from another window keeps its line breaks and is not sent until you press Enter.
 
 Type `@` to pick a file from the project. The list respects `.gitignore` and skips `node_modules`, `.git`, `dist`, and `build`. Use `↑`/`↓` to move, `Tab` or `Enter` to insert the path, and `Esc` to close the list without clearing the prompt. Names with spaces are inserted quoted.
+
+A reply is capped by the profile's `maxTokens` (4096 by default). When a reply is cut there, Kiro says so: a tool call whose arguments were truncated fails with the character count it received, and the turn ends with a `max_tokens` notice. A single `write_file` of a very large file is the usual cause; write it in parts, or raise `maxTokens` with `kiro model edit`. Tool results are capped separately at 60k characters.
 
 The status bar shows the profile, model, working directory, context meter (`ctx 42k/128k`), queued message count, and state (`ready`, `thinking…`, `replying…`, `running <tool>…`, `approval needed`, `cancelling…`, `Ctrl+C again to quit`). Long profile names are shortened in the middle. On wide terminals the context meter moves into the Usage card.
 
@@ -543,7 +546,19 @@ The index is rebuilt every turn, so edits to `SKILL.md` apply on the next messag
 
 ## MCP servers
 
-Kiro can start Model Context Protocol servers and offer their tools to the model. Servers are configured in JSON, one file per scope:
+The quickest way to add a server is the CLI, which writes the config for you and then tries to start it:
+
+```bash
+kiro mcp add agentrelay --url https://mcp.example.com/mcp \
+  --header "Authorization: Bearer ${AGENTRELAY_TOKEN}" --timeout 3600
+kiro mcp                    # list servers and whether they start
+kiro mcp remove agentrelay
+kiro mcp path               # print the config paths
+```
+
+`kiro mcp add` also takes `--env "K=V"`, `--user` (write to `~/.kiro/mcp.json`), `--force` (replace an existing name), and `--print` (show the JSON and write nothing). Inside the TUI, `/mcp` shows the same view.
+
+Kiro can also read the JSON directly, one file per scope:
 
 1. `<cwd>/.kiro/mcp.json` for the project
 2. `~/.kiro/mcp.json` for your machine
@@ -635,7 +650,7 @@ src/
   secrets.ts         credential registry: redaction and child-process env filtering
   sessions.ts        atomic session save/load/list
   model/             presets, discovery/test, context-window inference, shared wizard, CLI + screen renderer
-  mcp/               MCP config, JSON-RPC channel, stdio client, tool registry
+  mcp/               MCP config, JSON-RPC channel, stdio + HTTP clients, CLI, tool registry
   providers/         Provider interface, OpenAI-compatible implementation
   agent/             system prompt, skill discovery/parsing, agent loop, token estimates, compaction
   tools/             tool registry, fs/search/patch/shell/skill tools, checkpoints, glob/gitignore matching

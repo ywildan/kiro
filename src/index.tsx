@@ -24,6 +24,7 @@ import { runDoctor } from './doctor.js';
 import { VERSION } from './version.js';
 import { setExtraTools } from './tools/index.js';
 import { setupMcp, type McpSetup } from './mcp/registry.js';
+import { runMcpCli } from './mcp/cli.js';
 
 interface CliOptions {
   profile?: string;
@@ -46,6 +47,7 @@ const HELP = `Kiro: a small terminal coding agent
 
 Usage: kiro [options]
        kiro model [command]
+       kiro mcp [command]
        kiro doctor [options]
 
 Options:
@@ -80,6 +82,11 @@ Model commands:
 Update commands:
   kiro check         Compare the installed version with the latest on npm
   kiro update        Install the latest version from npm globally
+
+MCP servers:
+  kiro mcp           List configured servers and whether they start
+  kiro mcp add ...   Add a server (stdio or HTTP) without editing JSON
+  kiro mcp remove    Remove a server
 
 Diagnostics:
   kiro doctor        Check Node, config, key storage, and the active endpoint
@@ -241,6 +248,10 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === 'doctor') {
     process.exitCode = await runDoctor(rawArgs.slice(1));
+    return;
+  }
+  if (rawArgs[0] === 'mcp') {
+    process.exitCode = await runMcpCli(rawArgs.slice(1));
     return;
   }
 
