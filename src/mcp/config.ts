@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 
 /**
@@ -157,4 +158,83 @@ export function mcpEntryProblem(entry: McpServerEntry): string | null {
   if (entry.type === 'http') return entry.url ? null : 'no "url" was given';
   if (!entry.command) return 'no "command" was given';
   return null;
+}
+
+export type McpScope = 'project' | 'user';
+
+/**
+ * Writes one server into the chosen file, keeping the rest of it. A broken or
+ * missing file is replaced by a fresh `mcpServers` object, because there is
+ * nothing safe to merge into.
+ */
+export async function saveMcpServer(input: {
+  cwd: string;
+  home: string;
+  scope: McpScope;
+  name: string;
+  entry: McpServerEntry;
+}): Promise<{ path: string; replacedBrokenFile: boolean }> {
+  if (!/^[A-Za-z0-9_.-]+$/.test(input.name)) {
+    throw new Error(`Server name "${input.name}" may only use letters, digits, "_", "-", and ".".`);
+  }
+  const file = mcpConfigPath(input.cwd, input.scope, input.home);
+  const existing = await readMcpFile(file);
+  const replacedBrokenFile = existing.problem !== undefined;
+  const servers: Record<string, unknown> = replacedBrokenFile ? {} : { ...existing.servers };
+  servers[input.name] = serializeEntry(input.entry);
+
+  await mkdir(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await writeFile(temp, `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    await rename(temp, file);
+  } catch (error) {
+    await unlink(temp).catch(() => undefined);
+    throw new Error(`Could not write ${file}: ${(error as Error).message}`);
+  }
+  // The file can hold a bearer token, so keep it private where the OS supports it.
+  await chmod(file, 0o600).catch(() => undefined);
+  return { path: file, replacedBrokenFile };
+}
+
+/** Removes one server. Returns false when the name was not in that file. */
+export async function removeMcpServer(input: {
+  cwd: string;
+  home: string;
+  scope: McpScope;
+  name: string;
+}): Promise<boolean> {
+  const file = mcpConfigPath(input.cwd, input.scope, input.home);
+  const existing = await readMcpFile(file);
+  if (existing.problem || !existing.servers[input.name]) return false;
+  const servers = { ...existing.servers };
+  delete servers[input.name];
+  const temp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    await writeFile(temp, `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    await rename(temp, file);
+  } catch (error) {
+    await unlink(temp).catch(() => undefined);
+    throw new Error(`Could not write ${file}: ${(error as Error).message}`);
+  }
+  return true;
+}
+
+function serializeEntry(entry: McpServerEntry): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (entry.type === 'http') out.type = 'http';
+  if (entry.command) out.command = entry.command;
+  if (entry.args && entry.args.length > 0) out.args = entry.args;
+  if (entry.env) out.env = entry.env;
+  if (entry.url) out.url = entry.url;
+  if (entry.headers) out.headers = entry.headers;
+  if (entry.timeoutMs) out.timeout = entry.timeoutMs;
+  if (entry.disabled) out.disabled = true;
+  return out;
 }

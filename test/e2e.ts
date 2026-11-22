@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -73,7 +74,8 @@ import {
 import { addCost, costOf, formatCost, priceFor, sessionCost } from '../src/cost.js';
 import { RpcChannel, RpcError, RpcTimeoutError, createLineReader } from '../src/mcp/rpc.js';
 import { flattenContent, mcpToolName, readToolList } from '../src/mcp/client.js';
-import { loadMcpConfig, mcpEntryProblem, readMcpFile } from '../src/mcp/config.js';
+import { loadMcpConfig, mcpEntryProblem, readMcpFile, removeMcpServer, saveMcpServer } from '../src/mcp/config.js';
+import { runMcpCli } from '../src/mcp/cli.js';
 import { formatMcpStatus, isMcpTool, mcpNeedsApproval, setupMcp } from '../src/mcp/registry.js';
 import { connectStdio } from '../src/mcp/stdio.js';
 import { connectHttp, readSseMessage } from '../src/mcp/http.js';
@@ -2619,6 +2621,130 @@ async function main(): Promise<void> {
     }
   });
 
+
+
+  await test('kiro mcp adds a server without hand-editing JSON', async () => {
+    const dir = await tempDir('kiro-mcp-cli-');
+    const home = path.join(dir, 'home');
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    try {
+      // Adding starts the server to check it, and a failed check is expected
+      // here, so each call's output is captured instead of printed.
+      const out: string[] = [];
+      const err: string[] = [];
+      const originalOut = process.stdout.write.bind(process.stdout);
+      const originalErr = process.stderr.write.bind(process.stderr);
+      const run = async (argv: string[]): Promise<number> => {
+        process.stdout.write = ((chunk: string) => {
+          out.push(String(chunk));
+          return true;
+        }) as typeof process.stdout.write;
+        process.stderr.write = ((chunk: string) => {
+          err.push(String(chunk));
+          return true;
+        }) as typeof process.stderr.write;
+        try {
+          return await runMcpCli(argv, { cwd: dir, home });
+        } finally {
+          process.stdout.write = originalOut;
+          process.stderr.write = originalErr;
+        }
+      };
+
+      // A plain HTTP server, with a header and a long tool timeout.
+      assert.equal(
+        await run([
+            'add',
+            'remote',
+            '--url',
+            'https://example.invalid/mcp',
+            '--header',
+            'Authorization: Bearer ${MCP_TEST_TOKEN}',
+            '--timeout',
+            '3600',
+            '--print',
+          ]),
+        0,
+      );
+      assert.equal(existsSync(path.join(dir, '.kiro', 'mcp.json')), false, '--print writes nothing');
+
+      assert.equal(
+        await run(['add', 'remote', '--url', 'https://example.invalid/mcp', '--header', 'Authorization: Bearer abc']),
+        1,
+        'the entry is saved but reported as not started',
+      );
+      assert.match(out.join(''), /Added "remote"/);
+      assert.match(err.join(''), /Not started yet/);
+      const file = path.join(dir, '.kiro', 'mcp.json');
+      assert.equal(existsSync(file), true);
+      const saved = JSON.parse(await readFile(file, 'utf8')) as {
+        mcpServers: Record<string, { type?: string; url?: string; headers?: Record<string, string> }>;
+      };
+      assert.equal(saved.mcpServers.remote?.type, 'http');
+      assert.deepEqual(saved.mcpServers.remote?.headers, { Authorization: 'Bearer abc' });
+      if (process.platform !== 'win32') {
+        assert.equal((await stat(file)).mode & 0o777, 0o600, 'the file can hold a token, so it stays private');
+      }
+
+      // A second server keeps the first one. Adding it starts the server, which
+      // fails here on purpose, and the file is written either way.
+      await run(['add', 'fetch', 'node', 'server.js', '--env', 'TOKEN=x']);
+      const both = await loadMcpConfig(dir, home);
+      assert.deepEqual(Object.keys(both.servers).sort(), ['fetch', 'remote']);
+      assert.deepEqual(both.servers.fetch?.args, ['server.js']);
+      assert.deepEqual(both.servers.fetch?.env, { TOKEN: 'x' });
+
+      {
+        assert.equal(await run(['add', 'fetch', 'node', 'other.js']), 2);
+        assert.match(err.join(''), /already exists.*--force/);
+        assert.equal(await run(['add']), 2);
+        assert.match(err.join(''), /needs a server name/);
+        assert.equal(await run(['add', 'x', '--url', 'u', '--header', 'bad']), 2);
+        assert.match(err.join(''), /--header needs "Name: value"/);
+        assert.equal(await run(['add', 'y', '--url', 'u', 'node', 'z.js']), 2);
+        assert.match(err.join(''), /either a command or --url/);
+        assert.equal(await run(['add', 'z', '--timeout', 'soon', 'node', 'a.js']), 2);
+        assert.match(err.join(''), /positive number of seconds/);
+        assert.equal(await run(['nope']), 2);
+        assert.equal(await run(['remove', 'missing']), 1);
+      }
+
+      // Saving the same name again replaces it in place.
+      const replace = await saveMcpServer({
+        cwd: dir,
+        home,
+        scope: 'project',
+        name: 'fetch',
+        entry: { type: 'stdio', command: 'node', args: ['new.js'] },
+      });
+      assert.equal(replace.replacedBrokenFile, false);
+      assert.deepEqual((await loadMcpConfig(dir, home)).servers.fetch?.args, ['new.js']);
+
+      // Removing one leaves the other, and a missing name is reported.
+      assert.equal(await removeMcpServer({ cwd: dir, home, scope: 'project', name: 'fetch' }), true);
+      assert.equal(await removeMcpServer({ cwd: dir, home, scope: 'project', name: 'fetch' }), false);
+      assert.deepEqual(Object.keys((await loadMcpConfig(dir, home)).servers), ['remote']);
+
+      // A broken file is rewritten instead of merged, and a bad name is refused.
+      await writeFile(file, '{ not json', 'utf8');
+      const repaired = await saveMcpServer({
+        cwd: dir,
+        home,
+        scope: 'project',
+        name: 'fresh',
+        entry: { type: 'stdio', command: 'node' },
+      });
+      assert.equal(repaired.replacedBrokenFile, true);
+      assert.deepEqual(Object.keys((await loadMcpConfig(dir, home)).servers), ['fresh']);
+      await assert.rejects(
+        saveMcpServer({ cwd: dir, home, scope: 'project', name: 'bad name!', entry: { command: 'node' } }),
+        /may only use/,
+      );
+
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   await test('MCP streamable HTTP connects, lists tools over SSE, and honours the token and timeout', async () => {
     const port = 8900 + Math.floor(Math.random() * 90);

@@ -88,11 +88,18 @@ export async function executeTool(
   try {
     parsed = rawArguments.trim() === '' ? {} : JSON.parse(rawArguments);
   } catch (error) {
+    // The size is the useful clue: a reply cut at max_tokens always ends mid-value.
+    const size = rawArguments.length.toLocaleString();
+    const advice =
+      name === 'write_file' || name === 'apply_patch' || name === 'multi_edit'
+        ? 'For a large file, write the first part with write_file and add the rest with ' +
+          'edit_file or apply_patch, or reduce the content.'
+        : 'Split the work into several calls.';
     return toolError(
       `Invalid JSON arguments for ${name}: ${(error as Error).message}. ` +
+        `Kiro received ${size} characters. ` +
         'The arguments were truncated or malformed, often because the response hit its ' +
-        'max_tokens limit. Resend this call with smaller arguments (split the work into ' +
-        'several calls) or ask for a higher maxTokens.',
+        `max_tokens limit. ${advice} Ask for a higher maxTokens if the reply keeps getting cut.`,
     );
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {

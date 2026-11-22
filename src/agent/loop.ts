@@ -231,9 +231,9 @@ export async function* runAgentTurn(options: RunTurnOptions): AsyncGenerator<Age
         message:
           toolCalls.length > 0
             ? 'The model hit its max_tokens limit mid-response, so tool call arguments may be incomplete. ' +
-              'Raise maxTokens for this profile or ask for smaller steps.'
+              'Raise maxTokens for this profile (kiro model edit), or ask for a smaller step.'
             : 'The model hit its max_tokens limit and the response was cut short. ' +
-              'Raise maxTokens for this profile, or ask it to continue.',
+              'Raise maxTokens for this profile (kiro model edit), or ask it to continue.',
       };
     }
 
