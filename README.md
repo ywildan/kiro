@@ -100,7 +100,8 @@ kiro model test [name]                      # small chat completion, reports lat
 
 kiro model add --name <name> --base-url <url> --model <id> \
   [--api-key-env <VAR>] [--api-key <key>] \
-  [--temperature <0-2>] [--max-tokens <n>] [--set-active] [--no-test]
+  [--temperature <0-2>] [--max-tokens <n>] [--header <name:value>]...
+  [--set-active] [--no-test]
 ```
 
 `--flag=value` also works. `add` validates the URL, name, model, and numbers before saving, and a failed connection test saves nothing (use `--no-test` to skip it). Success exits `0`; validation, network, and test failures exit non-zero with a message on stderr.
@@ -110,6 +111,7 @@ Keys for `kiro model add`:
 - `--api-key <key>` writes the key to `~/.kiro/.env` under `--api-key-env`, or under a generated `KIRO_<PROFILE>_API_KEY`.
 - `--api-key-env <VAR>` stores nothing; the variable must already exist in the environment or in `~/.kiro/.env`.
 - With neither flag, the profile has no key, which is fine for local servers.
+- `--header "Name: value"` adds a request header and can repeat. The value may use `${VAR}` to read the environment, so a gateway token stays out of `config.json`. `Authorization`, `Content-Type`, and the other headers Kiro sends are refused; use `apiKeyEnv` for the key.
 
 ### Updates
 
@@ -184,6 +186,8 @@ Set `KIRO_ENV_PATH` to use a different `.env` file.
 | `temperature` | no | Sampling temperature. |
 | `maxTokens` | no | Maximum response tokens. |
 | `contextWindow` | no | Approximate context window in tokens, at least 1000. Defaults to `128000`; drives the ctx meter and compaction. |
+| `headers` | no | Extra request headers, for gateways that need a routing or API-version header. Values may use `${VAR}`. `Authorization` and the other headers Kiro sends are rejected. |
+| `pricing` | no | Price overrides in dollars per million tokens: `{ "input": 0.5, "output": 1.5 }`. Used for the cost estimate; the built-in table is a fallback. |
 
 `activeProfile` selects the profile used at startup. `/model <name>` switches at runtime and `--profile` switches for one run.
 
@@ -240,6 +244,7 @@ kiro [options]
   --no-mouse         Disable mouse reporting so plain click-drag selection works
   --no-alt-screen    Do not switch to the terminal's alternate screen
   --no-skills        Do not read skill folders at all (KIRO_NO_SKILLS=1 does the same)
+  --no-mcp           Do not start MCP servers (KIRO_NO_MCP=1 does the same)
   -h, --help         Show help
   -v, --version      Show version
 
@@ -302,7 +307,7 @@ Reasoning traces stream as a dim block and collapse to `reasoning (done, not sav
 
 Each finished reply shows its duration and, when the endpoint reports usage, output throughput (`8.4s · 23 tok/s`). Both are display-only and are not stored in sessions.
 
-On terminals at least 110 columns wide with room for 9 transcript rows, a Usage card sits to the right of the conversation. It shows session token totals (`↑` sent, `↓` received), API requests, a context gauge, and the last reply's timing. Totals come from endpoint usage, accumulate across tool rounds, and survive `/resume`; compaction requests are not counted. A `~` marks an estimated context number. Below 110 columns the card hides and `ctx` returns to the status bar. `/usage` toggles it, and `/context` prints the totals at any width.
+On terminals at least 110 columns wide with room for 9 transcript rows, a Usage card sits to the right of the conversation. It shows session token totals (`↑` sent, `↓` received), API requests, an estimated cost, a context gauge, and the last reply's timing. Totals come from endpoint usage, accumulate across tool rounds, and survive `/resume`; compaction requests are not counted. A `~` marks an estimated context number. Below 110 columns the card hides and `ctx` returns to the status bar. `/usage` toggles it, and `/context` prints the totals at any width.
 
 Replies render as Markdown: headings, emphasis, inline code, lists, task checkboxes, blockquotes, links, code blocks, and tables. Table columns size to their content, honour alignment markers, and wrap; a table too wide to read falls back to plain rows. Unknown markers stay literal, so streaming never breaks the layout.
 
@@ -313,6 +318,8 @@ Typing `/` opens the command palette over the bottom rows of the transcript, so 
 On a TTY, Kiro uses the alternate screen. When it exits, through `/exit`, a double Ctrl+C, or an error, the shell contents come back. Pipes and CI logs are untouched. `--no-alt-screen` stays on the normal screen.
 
 Mouse reporting is on by default, so the wheel scrolls the transcript. Hold Shift while dragging to select text, or run `/mouse` (or start with `--no-mouse`) to restore plain click-drag selection and scroll with `PgUp`/`PgDn`.
+
+While `run_command` runs, the status bar shows its newest output line and the running tool call keeps a dim `⎿ …` tail under it, so a build or test run reports progress instead of an idle spinner. The live line is display only: the full output still arrives with the tool result, and headless runs never print it.
 
 Tool results are one-line summaries. `Ctrl+O` expands the latest result inline; `PgUp`/`PgDn` scroll it. `/export` writes the whole conversation, including full tool arguments and results, to a Markdown file.
 
@@ -343,6 +350,10 @@ Tool results are one-line summaries. `Ctrl+O` expands the latest result inline; 
 | `/mouse` | Toggle mouse reporting: wheel scroll vs normal text selection |
 | `/allow` | List tools that skip approval for this session |
 | `/allow clear` | Ask for approval again for every tool |
+| `/rules` | List saved rules in `.kiro/permissions.json`, numbered |
+| `/rules remove <n>` | Delete one saved rule |
+| `/rules clear` | Delete the rule file |
+| `/mcp` | Show configured MCP servers, their state, and their tools |
 | `/exit` | Quit |
 
 `/model` has two steps. The first lists profiles grouped by endpoint, with the active one marked `*`; `Enter` opens the models. The second lists stored model ids with the current one marked `*`; `Enter` applies it and saves the choice. On the model step, type to filter (all space-separated terms must match), `Esc` clears the query and then goes back, and `Ctrl+R` refetches `GET /models`. `Ctrl+C` closes the picker.
@@ -407,13 +418,74 @@ Approvals show a diff, or the exact command, and offer:
 
 - `[y]` allow once
 - `[a]` allow this tool for the rest of the session (the status bar shows `auto:<tool>`; `/allow clear` revokes it)
+- `[s]` always allow this pattern (saved to `.kiro/permissions.json`; the prompt names the pattern first)
+- `[d]` always deny this exact command or path
 - `[n]` deny and return the refusal to the model
+
+The preview keeps six rows. A diff drops its `---`/`+++` file headers and window markers so the changed lines fit, and a long command keeps both ends, since a destructive step is often the last line. A preview that still does not fit ends with a count of the hidden rows.
 
 Paths resolve against the working directory. Symlinks and `..` escapes are caught with `realpath`: reads, listings, and searches outside the workspace are refused, while writes, edits, and patches outside it need an explicit approval warning. `run_command` times out after 60 seconds by default (maximum 600), kills the process group on timeout or cancel, and truncates output to about 20k characters, keeping the head and tail. `read_file` returns 400 lines by default (maximum 2000) and points at the next offset. `glob` and `grep` honour `.gitignore`, always skip `node_modules`, `.git`, `dist`, and `build`, and cap their output with a hint on narrowing the search. Every tool result is also capped at 60k characters.
 
 Read-only tools (`read_file`, `list_dir`, `glob`, `grep`) in one response run in parallel, and results are appended in call order. A write, edit, patch, or command breaks the batch and runs with an approval prompt.
 
 `--yolo` skips all approvals. The status bar shows a red `YOLO` badge, the transcript warns once, and `/help` repeats it. It cannot be turned off inside the session; restart without the flag. Use it only in directories you trust.
+
+### Cost estimate
+
+The Usage card shows an estimated cost in dollars next to the token counts, and
+`/context` prints the same number with the price used. Prices come from a small
+built-in table matched on the model id (`gpt-4o`, `claude-*-sonnet`, `gemini-*-flash`,
+`deepseek-*`, and similar), in dollars per million tokens. Local endpoints
+(`localhost`, a private address, `.local`) report `$0 free`. A `~` marks a total
+that includes a request whose model had no known price.
+
+The table is a convenience, not a bill. Set `pricing` in the profile for a
+private or resold endpoint:
+
+```json
+{
+  "type": "openai",
+  "baseUrl": "https://gateway.internal/v1",
+  "model": "team-large",
+  "pricing": { "input": 0.5, "output": 1.5 }
+}
+```
+
+Headless runs print one line of usage and cost to stderr at the end of a turn,
+so a CI job can watch spend without parsing the transcript.
+
+### Saved approval rules
+
+`[s]` and `[d]` write a rule to `.kiro/permissions.json` in the project, so the
+decision survives restarts and covers headless runs in CI:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    { "tool": "run_command", "match": "npm test*", "action": "allow" },
+    { "tool": "run_command", "match": "curl*", "action": "deny" }
+  ]
+}
+```
+
+`tool` is a tool name or `*`; `match` is a glob over the command text or the
+workspace-relative path, where `*` matches any characters (including `/`) and
+`?` matches one. The prompt shows the pattern before it is saved: `[s]` on
+`npm test -- --watch` offers `npm test*`, and on `rm -rf build` it offers
+`rm -rf build*` rather than the dangerous `rm*`.
+
+A shell command is split on `;`, `&&`, `||`, `|`, and newlines, and every part
+must be allowed, so `npm test*` never covers `npm test; rm -rf ~`. A deny rule
+always wins, and a deny still applies under `--yolo`. A rule never pre-approves
+a write outside the working directory; those always ask.
+
+Rules are read at startup and whenever the working directory changes. `/rules`
+lists them numbered, `/rules remove <n>` deletes one, and `/rules clear` removes
+the file. A broken file reports once and is treated as empty, so it cannot lock
+you out. Headless runs use the same rules and never write new ones: `kiro -p`
+approves only what a saved rule covers, plus `--yolo`. Set `KIRO_PERMISSIONS_PATH`
+to keep the rules outside the project.
 
 ### Undo and checkpoints
 
@@ -469,6 +541,78 @@ The index is rebuilt every turn, so edits to `SKILL.md` apply on the next messag
 - Model discovery and the connection test both time out after 10 seconds and can be cancelled.
 - Config saves are atomic and merge with the file on disk, so unknown fields survive. Invalid JSON can be backed up and replaced with a template.
 
+## MCP servers
+
+Kiro can start Model Context Protocol servers and offer their tools to the model. Servers are configured in JSON, one file per scope:
+
+1. `<cwd>/.kiro/mcp.json` for the project
+2. `~/.kiro/mcp.json` for your machine
+
+The project file wins when both define the same name. The shape matches the file other MCP clients use, so it can be copied in unchanged:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/notes"],
+      "env": { "LOG_LEVEL": "warn" }
+    },
+    "disabled-example": {
+      "command": "node",
+      "args": ["server.js"],
+      "disabled": true
+    }
+  }
+}
+```
+
+Both transports work. An entry with a `url` (or `"type": "http"`) is called over streamable HTTP: one POST per message, the reply as JSON or as an SSE stream, and the `Mcp-Session-Id` header repeated after the handshake. An entry with a `command` is started as a child process and spoken to over stdio. Entries marked `"disabled"` are listed by `/mcp` and skipped. Set `KIRO_MCP_CONFIG` to load a different file instead of the two defaults.
+
+A remote server usually needs a token. Put it in `headers` and point at the environment so the file stays free of secrets:
+
+```json
+{
+  "mcpServers": {
+    "agentrelay": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${AGENTRELAY_TOKEN}" },
+      "timeout": 3600000
+    }
+  }
+}
+```
+
+`timeout` is milliseconds and raises the limit for one `tools/call` on that server; `KIRO_MCP_TIMEOUT_MS` (default 30000) is the global value. Raise it for a tool that blocks, such as a long-poll `wait_for_message`; a per-server `timeout` wins. Ctrl+C still cancels such a call, because the request is aborted rather than waited out.
+
+The same server can be reached through a stdio shim instead, which is useful when the remote side needs a reconnect:
+
+```json
+{
+  "mcpServers": {
+    "agentrelay": {
+      "command": "npx",
+      "args": ["-y", "agentrelay-mcp", "--url", "https://mcp.example.com/mcp", "--token", "${AGENTRELAY_TOKEN}"],
+      "timeout": 3600000
+    }
+  }
+}
+```
+
+Server names and tool names become one tool name, `mcp__<server>__<tool>`, so two servers can offer the same tool. `/mcp` prints every server with its state, its tool count, and where the config came from.
+
+A few rules keep MCP predictable:
+
+- Every MCP tool call asks for approval, even under a session `[a]` allow, and saved rules cannot pre-approve one because the request has no rule subject. A server runs outside the workspace sandbox, so a rule that matches a command or a path does not describe it.
+- A server that fails to start is reported once and skipped. The rest of the session runs normally, and a server that prints non-JSON lines (a banner, a log line) produces a notice instead of an error.
+- The server inherits the environment Kiro runs with, minus stored credentials, plus any `env` in its entry. `${VAR}` inside a value is expanded from the environment.
+- Tool output is flattened to text: text and resource contents are kept, and image or audio blocks become a placeholder.
+- `--no-mcp` (or `KIRO_NO_MCP=1`) starts nothing. `KIRO_MCP_CONNECT_MS` sets the handshake timeout (default 15000) and `KIRO_MCP_TIMEOUT_MS` the timeout for a `tools/call` (default 30000), which a server's own `timeout` overrides.
+- A 401 or 403 on an HTTP server names the status and points at `headers`, instead of failing silently. An unreachable URL becomes an `error` status and the session continues.
+
+MCP tools are always treated as unsafe: no parallel batch, always an approval prompt. The protocol is JSON-RPC 2.0 over stdio, one JSON object per line.
+
 ## Testing
 
 ```bash
@@ -478,7 +622,7 @@ pnpm mock    # mock server on port 8787 for manual TUI testing
 
 The mock server streams scripted replies with tool calls, slow responses, and errors, and can force `401`/`404`, custom headers, or a dropped connection. Point a profile at `http://localhost:8787/v1` with any model name; no key is needed.
 
-The tests cover streaming and tool calls, approvals, retries and timeouts, path escapes, search and edit behaviour, config and key handling, compaction, sessions, the TUI components, and the skills pipeline from `SKILL.md` to `read_skill`. Pty runs exercise the palette, scrolling, Markdown, approvals, cancellation, and the `/usage` toggle. Model workflow tests use a temporary `$HOME`, so the real `~/.kiro` is never touched.
+The tests cover streaming and tool calls, approvals, retries and timeouts, path escapes, search and edit behaviour, config and key handling, compaction, sessions, the TUI components, and the skills pipeline from `SKILL.md` to `read_skill`. Ink components are rendered with `renderToString`, so layouts are checked as text, not through a terminal. Palette, scrolling, Markdown, approvals, cancellation, and the `/usage` toggle are covered this way. Model workflow tests use a temporary `$HOME`, so the real `~/.kiro` is never touched.
 
 ## Project layout
 
@@ -491,12 +635,14 @@ src/
   secrets.ts         credential registry: redaction and child-process env filtering
   sessions.ts        atomic session save/load/list
   model/             presets, discovery/test, context-window inference, shared wizard, CLI + screen renderer
+  mcp/               MCP config, JSON-RPC channel, stdio client, tool registry
   providers/         Provider interface, OpenAI-compatible implementation
   agent/             system prompt, skill discovery/parsing, agent loop, token estimates, compaction
   tools/             tool registry, fs/search/patch/shell/skill tools, checkpoints, glob/gitignore matching
   ui/                Ink app, markdown, command palette, prompt history, scrolling, approvals, status bar, export
 test/
   mock-server.ts     scripted OpenAI-compatible SSE server + /models variants
+  mcp-server.ts      small stdio MCP server used by the tests
   e2e.ts             backend test suite
 ```
 
@@ -506,7 +652,11 @@ test/
 - Model discovery assumes an OpenAI-compatible `GET /models`. Endpoints without it work, but the model id must be typed manually.
 - `@` lists files only and stops at 50,000 paths; directories and ignored files are not offered.
 - Removing a profile leaves its key in `~/.kiro/.env`; there is no command that deletes stored secrets.
-- No sub-agents, MCP, plugins, web search, image input, themes, or git integration.
+- No sub-agents, plugins, web search, image input, themes, or git integration.
+- The HTTP transport has no SSE reconnect and no server-to-client requests: a server that pushes a request over HTTP gets a notice, not an answer.
+- The live output line shows the newest line only, capped at 400 characters; earlier lines arrive with the tool result.
+- Approval rules match a glob, not a shell grammar: a rule for `npm test*` also covers `npm test-evil`. Review saved rules with `/rules` when a project's rules come from someone else.
+- The cost estimate uses a built-in list-price table that ages; `/context` names the price it used, and `pricing` in the profile overrides it.
 - Sessions are single-process and stored as plaintext JSON. There is no delete or rename command. The `/resume` picker can load a session from another directory and switches the working directory to it; `/export` writes a Markdown transcript you can keep.
 - `/undo` covers `write_file`, `edit_file`, `multi_edit`, and `apply_patch` only. It keeps the last 30 calls, and `run_command` changes are outside its reach; use Git for a complete safety net.
 - Prompt history is plaintext, capped at 200 entries per directory, and only recalled in the TUI (not in `-p` mode).

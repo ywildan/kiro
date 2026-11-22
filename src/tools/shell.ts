@@ -5,6 +5,8 @@ import { denied, ok, toolError } from './types.js';
 import { truncateMiddle } from './diff.js';
 
 const DEFAULT_TIMEOUT_SECONDS = 60;
+/** Longest live tail kept for the status bar; the transcript keeps the full result. */
+const MAX_LIVE_TAIL = 400;
 const MAX_TIMEOUT_SECONDS = 600;
 const MAX_OUTPUT_CHARS = 20_000;
 const CAPTURE_LIMIT = 80_000;
@@ -94,6 +96,7 @@ export const runCommandTool: Tool = {
       tool: 'run_command',
       title: 'Run command',
       detail: `$ ${command}`,
+      subject: command.trim(),
     };
     if (ctx.signal.aborted) return denied('Cancelled by user.');
     const decision = await ctx.approve(request);
@@ -179,10 +182,26 @@ export const runCommandTool: Tool = {
       ctx.signal.addEventListener('abort', onAbort, { once: true });
       if (ctx.signal.aborted) onAbort();
 
+      // The tail of the newest line is enough to see progress; the full output
+      // still arrives in the tool result when the command finishes.
+      let live = '';
+      const emitLive = (chunk: string): void => {
+        if (!ctx.onOutput) return;
+        live = (live + chunk).slice(-MAX_LIVE_TAIL);
+        const tail = live.slice(live.lastIndexOf('\n') + 1).trimEnd() || live.trimEnd();
+        ctx.onOutput({ tool: 'run_command', chunk, tail: tail.slice(-MAX_LIVE_TAIL) });
+      };
+
       child.stdout?.setEncoding('utf8');
       child.stderr?.setEncoding('utf8');
-      child.stdout?.on('data', (chunk: string) => stdout.add(chunk));
-      child.stderr?.on('data', (chunk: string) => stderr.add(chunk));
+      child.stdout?.on('data', (chunk: string) => {
+        stdout.add(chunk);
+        emitLive(chunk);
+      });
+      child.stderr?.on('data', (chunk: string) => {
+        stderr.add(chunk);
+        emitLive(chunk);
+      });
       child.on('error', (error) => finish(null, null, error));
       child.on('close', (code, signal) => finish(code, signal));
     });

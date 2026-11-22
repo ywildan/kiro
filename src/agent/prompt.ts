@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { platform, release } from 'node:os';
 import path from 'node:path';
 import { formatSkillIndex, loadSkills } from './skills.js';
+import { mcpPromptSection } from '../mcp/prompt.js';
 
 const MAX_AGENTS_MD_BYTES = 200_000;
 
@@ -59,6 +60,7 @@ export async function buildSystemPrompt(cwd: string): Promise<string> {
   ].join('\n');
 
   const [agents, inventory] = await Promise.all([readAgentsSection(cwd), loadSkills(cwd)]);
-  const sections = [base, agents, formatSkillIndex(inventory.skills)].filter(Boolean);
+  const mcp = mcpPromptSection();
+  const sections = [base, agents, formatSkillIndex(inventory.skills), mcp].filter(Boolean);
   return sections.length === 1 ? base : `${sections.join('\n\n')}\n`;
 }

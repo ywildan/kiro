@@ -2,9 +2,9 @@ import type { ChatMessage, Provider, TokenUsage, ToolCall } from '../providers/t
 import { ProviderError } from '../providers/types.js';
 import type { CompactResult } from './compact.js';
 import {
+  allToolDefinitions,
   executeTool,
   isReadOnlyTool,
-  toolDefinitions,
   type ToolResult,
 } from '../tools/index.js';
 import type { ToolContext } from '../tools/types.js';
@@ -36,6 +36,8 @@ export type AgentEvent =
   | { type: 'assistant'; content: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool-start'; toolCall: ToolCall }
+  /** Live output from a running tool; only the last line is shown, nothing is stored. */
+  | { type: 'tool-output'; toolCall: ToolCall; tail: string }
   | { type: 'tool-end'; toolCall: ToolCall; result: ToolResult; durationMs: number }
   | { type: 'usage'; usage: TokenUsage }
   | { type: 'notice'; level: 'info' | 'error'; message: string }
@@ -74,6 +76,28 @@ function cancelledResult(): ToolResult {
  * Runs one user turn, appending assistant/tool messages to `messages` as it goes.
  * The messages array must already contain the system prompt and the new user message.
  */
+/**
+ * Bridges a tool's live output callback to the async generator. Events queue up
+ * between awaits, and the generator drains them right before `tool-end`, so a
+ * chatty command cannot reorder or outrun the result.
+ */
+function liveOutput(ctx: ToolContext): {
+  ctx: ToolContext;
+  drain: () => string[];
+} {
+  const pending: string[] = [];
+  return {
+    ctx: {
+      ...ctx,
+      onOutput: (update) => {
+        // Keep only the newest line; a build log does not need a backlog.
+        pending.length > 0 ? (pending[0] = update.tail) : pending.push(update.tail);
+      },
+    },
+    drain: () => pending.splice(0, pending.length),
+  };
+}
+
 export async function* runAgentTurn(options: RunTurnOptions): AsyncGenerator<AgentEvent> {
   const { provider, messages, ctx } = options;
   const maxRounds = options.maxToolRounds ?? MAX_TOOL_ROUNDS;
@@ -123,7 +147,7 @@ export async function* runAgentTurn(options: RunTurnOptions): AsyncGenerator<Age
     let finishReason: string | undefined;
 
     try {
-      for await (const event of provider.stream(messages, toolDefinitions, { signal: ctx.signal })) {
+      for await (const event of provider.stream(messages, allToolDefinitions(), { signal: ctx.signal })) {
         if (ctx.signal.aborted) break;
         if (event.type === 'text') {
           textParts.push(event.text);
@@ -251,7 +275,12 @@ export async function* runAgentTurn(options: RunTurnOptions): AsyncGenerator<Age
         for (const toolCall of batch.calls) {
           yield { type: 'tool-start', toolCall };
           const startedAt = Date.now();
-          const result = await executeTool(toolCall.function.name, toolCall.function.arguments, ctx);
+          const live = liveOutput(ctx);
+          const result = await executeTool(
+            toolCall.function.name,
+            toolCall.function.arguments,
+            live.ctx,
+          );
           const durationMs = Date.now() - startedAt;
           messages.push({
             role: 'tool',
@@ -259,6 +288,9 @@ export async function* runAgentTurn(options: RunTurnOptions): AsyncGenerator<Age
             name: toolCall.function.name,
             content: result.content,
           });
+          for (const tail of live.drain()) {
+            yield { type: 'tool-output', toolCall, tail };
+          }
           yield { type: 'tool-end', toolCall, result, durationMs };
         }
         continue;

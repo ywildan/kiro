@@ -22,6 +22,8 @@ import { App, type StartupNotice } from './ui/App.js';
 import { runCheck, runUpdate } from './update.js';
 import { runDoctor } from './doctor.js';
 import { VERSION } from './version.js';
+import { setExtraTools } from './tools/index.js';
+import { setupMcp, type McpSetup } from './mcp/registry.js';
 
 interface CliOptions {
   profile?: string;
@@ -31,6 +33,8 @@ interface CliOptions {
   resume?: string;
   prompt?: string;
   yolo: boolean;
+  /** Skip MCP servers entirely, like --no-skills for skills. */
+  mcp: boolean;
   mouse: boolean;
   altScreen: boolean;
   skills: boolean;
@@ -61,6 +65,7 @@ Options:
   --no-alt-screen    Do not switch to the terminal's alternate screen
   --no-skills        Do not load skills from .kiro/skills, .claude/skills, or
                      ~/.kiro/skills (KIRO_NO_SKILLS=1 does the same)
+  --no-mcp           Do not start MCP servers from .kiro/mcp.json
   -h, --help         Show this help
   -v, --version      Show the version
 
@@ -117,6 +122,7 @@ function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     continueSession: false,
     yolo: false,
+    mcp: true,
     mouse: true,
     altScreen: true,
     skills: true,
@@ -155,6 +161,10 @@ function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === '--no-skills') {
       options.skills = false;
+      continue;
+    }
+    if (arg === '--no-mcp') {
+      options.mcp = false;
       continue;
     }
     const equals = arg.indexOf('=');
@@ -290,6 +300,32 @@ async function main(): Promise<void> {
     }
   }
 
+  /** MCP servers start before the UI so their tools are in the first request. */
+  const startupNotices: StartupNotice[] = [];
+  const mcpEnabled = options.mcp && process.env.KIRO_NO_MCP !== '1';
+  const startupMcp: McpSetup | null = mcpEnabled
+    ? await setupMcp(process.cwd(), {
+        onNotice: (message) => startupNotices.push({ level: 'muted', text: message }),
+      })
+    : null;
+  if (startupMcp) {
+    setExtraTools(startupMcp.tools);
+    const ready = startupMcp.statuses.filter((status) => status.state === 'ready');
+    if (ready.length > 0) {
+      startupNotices.push({
+        level: 'info',
+        text: `MCP: ${ready.length} server${ready.length === 1 ? '' : 's'} ready (${ready
+          .map((status) => `${status.name}: ${status.tools} tool${status.tools === 1 ? '' : 's'}`)
+          .join(', ')}). /mcp for details.`,
+      });
+    }
+    for (const status of startupMcp.statuses.filter((entry) => entry.state === 'error')) {
+      startupNotices.push({
+        level: 'error',
+        text: `MCP server "${status.name}" did not start: ${status.detail ?? 'unknown error'}`,
+      });
+    }
+  }
   if (headless) {
     if (options.resume && options.continueSession) {
       console.error('Kiro: both --resume and --continue were given with -p; --resume wins.');
@@ -310,12 +346,12 @@ async function main(): Promise<void> {
       });
     } finally {
       process.off('SIGINT', onInterrupt);
+      // Servers are started for this run; a headless exit must not leave them alive.
+      await startupMcp?.close();
     }
     return;
   }
 
-  let initialSession: SessionRecord | null = null;
-  const startupNotices: StartupNotice[] = [];
   if (options.resume && options.continueSession) {
     startupNotices.push({
       level: 'info',
@@ -328,6 +364,8 @@ async function main(): Promise<void> {
       text: `The previous config was unreadable and was backed up to ${backup}; a fresh template is now in use.`,
     });
   }
+
+  let initialSession: SessionRecord | null = null;
   if (options.resume) {
     try {
       initialSession = await loadSession(process.cwd(), options.resume);
@@ -368,12 +406,15 @@ async function main(): Promise<void> {
         mouseEnabled={options.mouse}
         initialSession={initialSession}
         startupNotices={startupNotices}
+        mcp={startupMcp}
       />,
       { exitOnCtrlC: false, maxFps: 30 },
     );
     await instance.waitUntilExit();
   } finally {
     leaveScreen();
+    // Server processes must not outlive the session.
+    await startupMcp?.close();
   }
   process.exit(0);
 }

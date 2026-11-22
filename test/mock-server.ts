@@ -154,7 +154,8 @@ export async function createMockServer(options: MockServerOptions = {}): Promise
       return;
     }
 
-    if (req.method !== 'POST' || !req.url?.endsWith('/chat/completions')) {
+    // Query strings are allowed: gateway-style base URLs carry api-version.
+    if (req.method !== 'POST' || !requestUrl.pathname.endsWith('/chat/completions')) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'not found' } }));
       return;

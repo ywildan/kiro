@@ -47,6 +47,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   loadConfig,
   normalizeBaseUrl,
+  parseHeaderEntry,
   recoverConfig,
   resolveProfile,
   saveConfig,
@@ -55,6 +56,31 @@ import {
   validateProfileName,
   type KiroConfig,
 } from '../src/config.js';
+import { buildDiff } from '../src/tools/diff.js';
+import {
+  addRule,
+  clearRules,
+  evaluateRules,
+  loadRules,
+  matchesPattern,
+  permissionsPath,
+  removeRule,
+  saveRules,
+  splitCommand,
+  suggestRulePattern,
+  type PermissionRule,
+} from '../src/permissions.js';
+import { addCost, costOf, formatCost, priceFor, sessionCost } from '../src/cost.js';
+import { RpcChannel, RpcError, RpcTimeoutError, createLineReader } from '../src/mcp/rpc.js';
+import { flattenContent, mcpToolName, readToolList } from '../src/mcp/client.js';
+import { loadMcpConfig, mcpEntryProblem, readMcpFile } from '../src/mcp/config.js';
+import { formatMcpStatus, isMcpTool, mcpNeedsApproval, setupMcp } from '../src/mcp/registry.js';
+import { connectStdio } from '../src/mcp/stdio.js';
+import { connectHttp, readSseMessage } from '../src/mcp/http.js';
+import { setExtraTools, allToolDefinitions, allTools } from '../src/tools/index.js';
+import { chatEndpoint, endpointUrl, profileHeaders, requestHeaders } from '../src/providers/request.js';
+import { ApprovalPrompt } from '../src/ui/ApprovalPrompt.js';
+import { windowPreview } from '../src/ui/approval-preview.js';
 import {
   defaultKeyEnv,
   keyStatus,
@@ -2066,6 +2092,1105 @@ async function main(): Promise<void> {
     }
   });
 
+
+  await test('an approval preview shows the changed lines instead of the diff header', async () => {
+    const before = Array.from({ length: 40 }, (_, index) => `  item${index}();`).join('\n');
+    for (const target of [1, 20, 38]) {
+      const after = before
+        .split('\n')
+        .map((line, index) => (index === target ? `  item${target}Changed();` : line))
+        .join('\n');
+      const diff = buildDiff('src/util.ts', before, after);
+      const rendered = renderToString(
+        React.createElement(ApprovalPrompt, {
+          request: { tool: 'edit_file', title: 'Edit src/util.ts', detail: diff.text },
+          width: 90,
+          onDecision: () => {},
+        }),
+        { columns: 90 },
+      );
+      assert.ok(
+        rendered.includes(`item${target}Changed`),
+        `the added line for change ${target} is visible:\n${rendered}`,
+      );
+      assert.ok(rendered.includes(`-  item${target}();`), 'the removed line is visible too');
+      assert.ok(!rendered.includes('--- a/src/util.ts'), 'the file header no longer eats the budget');
+    }
+
+    const command = ['set -e', 'echo "building"', 'pnpm install', 'pnpm build', 'rm -rf dist/cache'];
+    const rendered = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'run_command', title: 'Run command', detail: `$ ${command.join('\n')}` },
+        width: 80,
+        onDecision: () => {},
+      }),
+      { columns: 80 },
+    );
+    assert.ok(rendered.includes('set -e'), 'the start of a command stays visible');
+    assert.ok(rendered.includes('rm -rf dist/cache'), 'the destructive tail stays visible');
+
+    const many = Array.from({ length: 40 }, (_, index) => `line ${index}`);
+    const windowed = windowPreview(many, 'run_command', 6);
+    assert.equal(windowed.length, 6);
+    assert.match(windowed[3] ?? '', /hidden/, 'the hidden middle is counted');
+    assert.equal(windowed[0], 'line 0');
+    assert.equal(windowed[5], 'line 39');
+
+    const none = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'write_file', title: 'Create notes.md' },
+        width: 70,
+        onDecision: () => {},
+      }),
+      { columns: 70 },
+    );
+    assert.match(none, /no preview/);
+  });
+
+  await test('profile headers and query strings reach every request', async () => {
+    const mock = await createMockServer({
+      models: ['mock-alpha'],
+      turns: [{ type: 'text', text: 'OK' }],
+    });
+    try {
+      process.env.KIRO_TEST_ROUTING = 'team-blue';
+      const profile = {
+        type: 'openai',
+        baseUrl: `${mock.url}/v1?api-version=2024-10-21`,
+        model: 'mock-alpha',
+        headers: { 'x-routing': 'team-blue', 'x-token': '${KIRO_TEST_ROUTING}' },
+      };
+      assert.equal(
+        chatEndpoint(profile.baseUrl),
+        `${mock.url}/v1/chat/completions?api-version=2024-10-21`,
+        'the query string survives and the path is not duplicated',
+      );
+      assert.equal(
+        chatEndpoint(`${mock.url}/v1/chat/completions`),
+        `${mock.url}/v1/chat/completions`,
+        'a base that already names the endpoint is not doubled',
+      );
+      assert.equal(endpointUrl(`${mock.url}/v1`, 'models'), `${mock.url}/v1/models`);
+
+      const headers = profileHeaders(profile);
+      assert.equal(headers['x-routing'], 'team-blue');
+      assert.equal(headers['x-token'], 'team-blue', '${VAR} reads the environment');
+      delete process.env.KIRO_TEST_ROUTING;
+      assert.equal(
+        profileHeaders({ ...profile, headers: { 'x-token': '${KIRO_MISSING_VAR}' } })['x-token'],
+        '${KIRO_MISSING_VAR}',
+        'an unknown variable stays literal instead of becoming empty',
+      );
+
+      const reserved = profileHeaders({
+        ...profile,
+        headers: { authorization: 'Bearer x', 'content-type': 'text/plain', 'x-ok': '1' },
+      });
+      assert.deepEqual(reserved, { 'x-ok': '1' });
+      assert.deepEqual(requestHeaders({ ...profile, headers: {} }, 'key-123'), {
+        Authorization: 'Bearer key-123',
+      });
+      assert.deepEqual(
+      profileHeaders({ ...profile, headers: { Authorization: 'raw-key' } }),
+      {},
+      'Authorization cannot be set twice; the key belongs in apiKeyEnv',
+    );
+
+      const test = await testConnection(profile, 'key-123');
+      assert.equal(test.ok, true, test.message);
+      const sent = mock.requests[0];
+      assert.equal(sent?.headers['x-routing'], 'team-blue');
+      assert.equal(sent?.headers.authorization, 'Bearer key-123');
+
+      await discoverModels({ baseUrl: profile.baseUrl, apiKey: 'key-123', headers: profile.headers });
+      assert.equal(mock.modelRequests[0]?.headers['x-routing'], 'team-blue');
+      assert.match(mock.modelRequests[0]?.url ?? '', /api-version=2024-10-21/);
+    } finally {
+      await mock.close();
+    }
+  });
+
+  await test('config validates custom headers and saves them', async () => {
+    const dir = await tempDir('kiro-headers-');
+    const file = path.join(dir, 'config.json');
+    const previousConfig = process.env.KIRO_CONFIG_PATH;
+    process.env.KIRO_CONFIG_PATH = file;
+    try {
+      const base = {
+        type: 'openai',
+        baseUrl: 'https://api.example.com/v1',
+        model: 'm',
+        headers: { 'api-key': 'abc', 'x-team': 'infra' },
+      };
+      const config: KiroConfig = { activeProfile: 'p', profiles: { p: base } };
+      const validated = validateConfig(config);
+      assert.deepEqual(validated.profiles.p?.headers, { 'api-key': 'abc', 'x-team': 'infra' });
+      await saveConfig(config, { path: file });
+      const saved = JSON.parse(await readFile(file, 'utf8'));
+      assert.deepEqual(saved.profiles.p.headers, { 'api-key': 'abc', 'x-team': 'infra' });
+
+      const rerun = await loadConfig();
+      assert.deepEqual(rerun.config.profiles.p?.headers, { 'api-key': 'abc', 'x-team': 'infra' });
+
+      assert.throws(
+        () => validateConfig({ ...config, profiles: { p: { ...base, headers: { authorization: 'x' } } } }),
+        /set by Kiro/,
+      );
+      assert.throws(
+        () => validateConfig({ ...config, profiles: { p: { ...base, headers: { 'x-a': 'line\nbreak' } } } }),
+        /single-line/,
+      );
+      assert.throws(
+        () => validateConfig({ ...config, profiles: { p: { ...base, headers: 'nope' } } }),
+        /must be an object/,
+      );
+
+      assert.deepEqual(parseHeaderEntry('api-key: ${AZURE_KEY}'), {
+        name: 'api-key',
+        value: '${AZURE_KEY}',
+      });
+      assert.deepEqual(parseHeaderEntry('  x-team :infra  '), { name: 'x-team', value: 'infra' });
+      assert.throws(() => parseHeaderEntry('no-colon'), /Name: value/);
+      assert.throws(() => parseHeaderEntry('x-empty:'), /needs a value/);
+      assert.throws(() => parseHeaderEntry('bad name: v'), /not a valid header name/);
+    } finally {
+      if (previousConfig === undefined) delete process.env.KIRO_CONFIG_PATH;
+      else process.env.KIRO_CONFIG_PATH = previousConfig;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('scripted kiro model add accepts --header flags', async () => {
+    const dir = await tempDir('kiro-header-cli-');
+    const configFile = path.join(dir, 'config.json');
+    const envFile = path.join(dir, '.env');
+    const project = await tempDir('kiro-header-project-');
+    const previous = {
+      config: process.env.KIRO_CONFIG_PATH,
+      env: process.env.KIRO_ENV_PATH,
+    };
+    process.env.KIRO_CONFIG_PATH = configFile;
+    process.env.KIRO_ENV_PATH = envFile;
+    try {
+      const mock = await createMockServer({ models: ['mock-alpha'], turns: [{ type: 'text', text: 'OK' }] });
+      try {
+        const tsxCli = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+        const cliPath = path.join(process.cwd(), 'src', 'index.tsx');
+        const run = (args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> =>
+          new Promise((resolve, reject) => {
+            const child = spawn(process.execPath, [tsxCli, cliPath, ...args], {
+              cwd: project,
+              env: { ...process.env },
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout.setEncoding('utf8');
+            child.stderr.setEncoding('utf8');
+            child.stdout.on('data', (chunk: string) => (stdout += chunk));
+            child.stderr.on('data', (chunk: string) => (stderr += chunk));
+            child.on('error', reject);
+            child.on('close', (status) => resolve({ status, stdout, stderr }));
+          });
+
+        const added = await run([
+          'model',
+          'add',
+          '--name',
+          'routed',
+          '--base-url',
+          `${mock.url}/v1?api-version=1`,
+          '--model',
+          'mock-alpha',
+          '--header',
+          'x-team: infra',
+          '--header',
+          'x-version: v2',
+          '--set-active',
+        ]);
+        assert.equal(added.status, 0, added.stderr);
+        const saved = JSON.parse(await readFile(configFile, 'utf8'));
+        assert.deepEqual(saved.profiles.routed.headers, { 'x-team': 'infra', 'x-version': 'v2' });
+        assert.equal(saved.activeProfile, 'routed');
+        assert.equal(mock.requests.at(-1)?.headers['x-team'], 'infra');
+
+        const bad = await run([
+          'model',
+          'add',
+          '--name',
+          'bad',
+          '--base-url',
+          `${mock.url}/v1`,
+          '--model',
+          'mock-alpha',
+          '--header',
+          'authorization: x',
+          '--no-test',
+        ]);
+        assert.equal(bad.status, 2);
+        assert.match(bad.stderr, /set by Kiro/);
+      } finally {
+        await mock.close();
+      }
+    } finally {
+      if (previous.config === undefined) delete process.env.KIRO_CONFIG_PATH;
+      else process.env.KIRO_CONFIG_PATH = previous.config;
+      if (previous.env === undefined) delete process.env.KIRO_ENV_PATH;
+      else process.env.KIRO_ENV_PATH = previous.env;
+      await rm(dir, { recursive: true, force: true });
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+
+
+
+  await test('the MCP JSON-RPC channel frames messages, matches ids, and fails cleanly', async () => {
+    const written: string[] = [];
+    const channel = new RpcChannel({
+      write: (line) => written.push(line),
+      timeoutMs: 200,
+      onNotice: (message) => written.push(`notice:${message}`),
+    });
+    channel.handle('roots/list', () => ({ roots: [] }));
+
+    const pending = channel.request('tools/list', {});
+    assert.equal(written.length, 1);
+    const sent = JSON.parse(written[0]!);
+    assert.deepEqual(sent, { jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+    assert.ok(written[0]!.endsWith('\n'), 'every message is one line');
+
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { tools: [] } }));
+    assert.deepEqual(await pending, { tools: [] });
+
+    // A server-to-client request is answered, an unknown one gets an error.
+    // Handler answers land on a microtask, so give them a turn.
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', id: 99, method: 'roots/list' }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(JSON.parse(written.at(-1)!).id, 99);
+    assert.deepEqual(JSON.parse(written.at(-1)!).result, { roots: [] });
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', id: 98, method: 'sampling/createMessage' }));
+    await new Promise((resolve) => setImmediate(resolve));
+    const unknownReply = JSON.parse(written.at(-1)!);
+    assert.equal(unknownReply.error?.code, -32601);
+
+    // Non-JSON output and notifications never throw.
+    channel.receive('server said hello');
+    assert.ok(written.some((line) => line.startsWith('notice:MCP server printed non-JSON')));
+    channel.receive(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/progress' }));
+    assert.ok(written.some((line) => line.includes('notification ignored')));
+
+    const failing = channel.request('tools/call', { name: 'x' });
+    channel.receive(
+      JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32602, message: 'bad args' } }),
+    );
+    await assert.rejects(failing, (error: unknown) => error instanceof RpcError && /bad args/.test(error.message));
+
+    const timingOut = channel.request('slow/thing');
+    await assert.rejects(timingOut, (error: unknown) => error instanceof RpcTimeoutError);
+
+    const reader = createLineReader(() => {});
+    const lines: string[] = [];
+    const collect = createLineReader((line) => lines.push(line));
+    collect.push('{"a":1}\n{"b"');
+    collect.push(':2}\n\n');
+    collect.flush();
+    assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '']);
+    void reader;
+
+    channel.close();
+    await assert.rejects(channel.request('after/close'), /closed/);
+  });
+
+  await test('MCP tool definitions and content are normalized', async () => {
+    assert.equal(mcpToolName('my-server', 'do.it'), 'mcp__my_server__do_it');
+    assert.equal(isMcpTool('mcp__srv__t'), true);
+    assert.equal(isMcpTool('read_file'), false);
+    assert.equal(mcpNeedsApproval({ tool: 'mcp__srv__t', title: 'x' }), true);
+    assert.equal(mcpNeedsApproval({ tool: 'run_command', title: 'x', subject: 'ls' }), false);
+
+    const tools = readToolList({
+      tools: [
+        { name: 'ok', description: 'fine', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } },
+        { name: '', description: 'nameless' },
+        { name: 'no-schema' },
+        'garbage',
+      ],
+    });
+    assert.equal(tools.length, 2);
+    assert.equal(tools[0]?.name, 'ok');
+    assert.deepEqual(tools[1]?.inputSchema, { type: 'object', properties: {} });
+
+    assert.equal(
+      flattenContent([
+        { type: 'text', text: 'one' },
+        { type: 'image', mimeType: 'image/png' },
+        { type: 'resource', resource: { uri: 'file:///a.md', text: 'two' } },
+        { type: 'text', text: '' },
+      ]),
+      ['one', '[image content omitted: Kiro cannot display images]', 'file:///a.md\ntwo'].join('\n'),
+    );
+    assert.equal(flattenContent('plain string'), 'plain string');
+    assert.equal(flattenContent(undefined), '');
+
+    assert.equal(mcpEntryProblem({ type: 'http', url: 'https://example.com/mcp' }), null);
+    assert.match(mcpEntryProblem({ type: 'http' }) ?? '', /url/);
+    assert.match(mcpEntryProblem({ disabled: true }) ?? '', /disabled/);
+    assert.match(mcpEntryProblem({ command: '' }) ?? '', /command/);
+    assert.equal(mcpEntryProblem({ command: 'node' }), null);
+  });
+
+  await test('MCP config merges project and user files with the project winning', async () => {
+    const dir = await tempDir('kiro-mcp-config-');
+    const home = path.join(dir, 'home');
+    const project = path.join(dir, 'project');
+    await mkdir(path.join(project, '.kiro'), { recursive: true });
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    try {
+      await writeFile(
+        path.join(home, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            shared: { command: 'user-command' },
+            onlyUser: { command: 'node', args: ['x.js'], env: { TOKEN: '${MY_TOKEN}' } },
+          },
+        }),
+        'utf8',
+      );
+      await writeFile(
+        path.join(project, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            shared: { command: 'project-command', disabled: true },
+            remote: { url: 'https://example.com/mcp', headers: { 'x-key': 'k' } },
+          },
+        }),
+        'utf8',
+      );
+
+      const loaded = await loadMcpConfig(project, home);
+      assert.deepEqual(Object.keys(loaded.servers).sort(), ['onlyUser', 'remote', 'shared']);
+      assert.equal(loaded.servers.shared?.command, 'project-command', 'the project file wins');
+      assert.equal(loaded.servers.shared?.disabled, true);
+      assert.equal(loaded.servers.remote?.type, 'http');
+      assert.deepEqual(loaded.servers.remote?.headers, { 'x-key': 'k' });
+      assert.equal(loaded.servers.remote?.timeoutMs, undefined, 'no timeout means the default');
+      assert.deepEqual(loaded.servers.onlyUser?.args, ['x.js']);
+      assert.equal(loaded.problems.length, 0);
+      assert.equal(loaded.sources.length, 2);
+
+      await writeFile(path.join(project, '.kiro', 'mcp.json'), '{ broken', 'utf8');
+      const broken = await loadMcpConfig(project, home);
+      assert.equal(broken.servers.shared?.command, 'user-command', 'the user file still loads');
+      assert.match(broken.problems[0] ?? '', /not valid JSON/);
+
+      const single = await readMcpFile(path.join(dir, 'missing.json'));
+      assert.deepEqual(single, { servers: {} });
+
+      await writeFile(path.join(project, '.kiro', 'mcp.json'), JSON.stringify({ nope: true }), 'utf8');
+      assert.match((await readMcpFile(path.join(project, '.kiro', 'mcp.json'))).problem ?? '', /mcpServers/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('MCP servers start over stdio, list tools, and report failures', async () => {
+    const dir = await tempDir('kiro-mcp-run-');
+    const home = path.join(dir, 'home');
+    await mkdir(path.join(dir, '.kiro'), { recursive: true });
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    const serverPath = path.join(process.cwd(), 'test', 'mcp-server.ts');
+    const tsx = path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    try {
+      await writeFile(
+        path.join(dir, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            demo: { command: process.execPath, args: [tsx, serverPath] },
+            broken: { command: path.join(dir, 'does-not-exist') },
+            off: { command: 'node', disabled: true },
+            web: { type: 'http' },
+          },
+        }),
+        'utf8',
+      );
+      const notices: string[] = [];
+      const setup = await setupMcp(dir, { home, onNotice: (message) => notices.push(message) });
+      try {
+        const states = Object.fromEntries(setup.statuses.map((status) => [status.name, status.state]));
+        assert.equal(states.demo, 'ready');
+        assert.equal(states.broken, 'error');
+        assert.equal(states.off, 'skipped');
+        assert.equal(states.web, 'skipped');
+
+        const demo = setup.statuses.find((status) => status.name === 'demo');
+        assert.equal(demo?.tools, 3);
+        assert.equal(demo?.transport, 'builtin');
+        assert.match(demo?.detail ?? '', /kiro-test-server 1\.2\.3/);
+        assert.ok(
+          notices.some((message) => /non-JSON output: mcp-server starting/.test(message)),
+          'a banner on stdout is reported, not treated as a protocol error',
+        );
+
+        const names = setup.definitions.map((definition) => definition.function.name).sort();
+        assert.deepEqual(names, [
+          'mcp__demo__fail_tool',
+          'mcp__demo__lookup_time',
+          'mcp__demo__rich_content',
+        ]);
+        const lookup = setup.definitions.find((definition) => definition.function.name === 'mcp__demo__lookup_time');
+        assert.deepEqual(lookup?.function.parameters.required, ['zone']);
+        assert.match(lookup?.function.description ?? '', /read-only/);
+        assert.match(lookup?.function.description ?? '', /Requires user approval/);
+
+        // Tools run through the registry and always ask first.
+        setExtraTools(setup.tools);
+        assert.equal(allTools().some((tool) => tool.mcp === true), true);
+        assert.ok(allToolDefinitions().some((definition) => definition.function.name === 'mcp__demo__lookup_time'));
+
+        const requests: ApprovalRequest[] = [];
+        const ctx = {
+          cwd: dir,
+          signal: new AbortController().signal,
+          approve: async (request: ApprovalRequest) => {
+            requests.push(request);
+            return 'allow' as const;
+          },
+        };
+        const result = await executeTool(
+          'mcp__demo__lookup_time',
+          JSON.stringify({ zone: 'Cilacap' }),
+          ctx,
+        );
+        assert.equal(result.status, 'ok');
+        assert.match(result.content, /2026-01-01T00:00:00 Cilacap/);
+        assert.equal(requests[0]?.tool, 'mcp__demo__lookup_time');
+        assert.equal(requests[0]?.subject, undefined, 'no subject means no rule can pre-approve it');
+        assert.match(requests[0]?.warning ?? '', /outside Kiro's file sandbox|runs inside the MCP server/);
+        assert.match(requests[0]?.detail ?? '', /Cilacap/);
+
+        const rich = await executeTool('mcp__demo__rich_content', '{}', ctx);
+        assert.match(rich.content, /first block/);
+        assert.match(rich.content, /image content omitted/);
+        assert.match(rich.content, /file:\/\/\/notes\.md/);
+
+        const failed = await executeTool('mcp__demo__fail_tool', '{}', ctx);
+        assert.equal(failed.status, 'error');
+        assert.match(failed.content, /the tool refused/);
+
+        const denied = await executeTool('mcp__demo__lookup_time', '{"zone":"x"}', {
+          ...ctx,
+          approve: async () => 'deny' as const,
+        });
+        assert.equal(denied.status, 'denied');
+
+        const unknown = await executeTool('mcp__demo__nope', '{}', ctx);
+        assert.match(unknown.content, /Unknown tool/);
+
+        const status = formatMcpStatus(setup, dir);
+        assert.match(status, /ok\s+demo \(3 tools\)/);
+        assert.match(status, /fail\s+broken/);
+        assert.match(status, /skip\s+off/);
+        assert.match(status, /Read from:/);
+      } finally {
+        await setup.close();
+        setExtraTools([]);
+      }
+
+      // A server that prints nothing at all still answers the handshake.
+      const quiet = await connectStdio('quiet', {
+        command: process.execPath,
+        args: [tsx, serverPath],
+        env: { MCP_BANNER: '0' },
+      });
+      try {
+        assert.equal(quiet.serverName, 'quiet');
+        assert.equal((await quiet.listTools()).length, 3);
+      } finally {
+        await quiet.close();
+      }
+
+      assert.equal(formatMcpStatus(null), 'MCP is off for this run.');
+      assert.match(
+        formatMcpStatus({ tools: [], definitions: [], statuses: [], config: { servers: {}, sources: [], problems: [] }, close: async () => {} }),
+        /No MCP servers configured/,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+
+  await test('MCP streamable HTTP connects, lists tools over SSE, and honours the token and timeout', async () => {
+    const port = 8900 + Math.floor(Math.random() * 90);
+    const server = spawn(
+      process.execPath,
+      [path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'), path.join(process.cwd(), 'test', 'mcp-http-server.ts'), String(port)],
+      { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } },
+    );
+    const ready = new Promise<void>((resolve, reject) => {
+      let seen = '';
+      const timer = setTimeout(() => reject(new Error('the fixture server did not start')), 20_000);
+      server.stdout?.setEncoding('utf8');
+      server.stdout?.on('data', (chunk: string) => {
+        seen += chunk;
+        if (/listening/.test(seen)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      server.on('error', reject);
+    });
+    const url = `http://127.0.0.1:${port}/mcp`;
+    try {
+      await ready;
+      const endpoint = await connectHttp('demo', { url, headers: { Authorization: 'Bearer test-token' } });
+      try {
+        assert.equal(endpoint.transport, 'http');
+        assert.equal(endpoint.serverInfo.name, 'kiro-http-server');
+        const tools = await endpoint.listTools();
+        assert.deepEqual(tools.map((tool) => tool.name), ['http_echo', 'http_slow']);
+        assert.equal(tools[0]?.annotations?.readOnlyHint, true);
+        assert.deepEqual(await endpoint.callTool('http_echo', { text: 'hi' }), { content: 'echo: hi', isError: false });
+      } finally {
+        await endpoint.close();
+      }
+
+      await assert.rejects(
+        connectHttp('bad-token', { url, headers: { Authorization: 'Bearer wrong' } }),
+        (error: unknown) =>
+          /401 Unauthorized/.test((error as Error).message) && /Check the "headers"/.test((error as Error).message),
+      );
+
+      // A header can read its token from the environment.
+      process.env.KIRO_TEST_MCP_TOKEN = 'test-token';
+      const fromEnv = await connectHttp('from-env', {
+        url,
+        headers: { Authorization: 'Bearer ${KIRO_TEST_MCP_TOKEN}' },
+      });
+      try {
+        assert.deepEqual(await fromEnv.callTool('http_echo', { text: 'env' }), { content: 'echo: env', isError: false });
+      } finally {
+        await fromEnv.close();
+        delete process.env.KIRO_TEST_MCP_TOKEN;
+      }
+
+      // A short per-server timeout fails the call instead of hanging.
+      const quick = await connectHttp('quick', { url, headers: { Authorization: 'Bearer test-token' }, timeoutMs: 100 });
+      try {
+        await assert.rejects(quick.callTool('http_slow', {}), /did not answer within 0\.1s/);
+      } finally {
+        await quick.close();
+      }
+
+      // Ctrl+C reaches a blocking call: the abort ends it at once.
+      const blocking = await connectHttp('blocking', {
+        url,
+        headers: { Authorization: 'Bearer test-token' },
+        timeoutMs: 3_600_000,
+      });
+      try {
+        const controller = new AbortController();
+        const started = Date.now();
+        const pending = blocking.callTool('http_slow', {}, controller.signal);
+        setTimeout(() => controller.abort(), 50);
+        await assert.rejects(pending, /cancelled/);
+        assert.ok(Date.now() - started < 2_000, 'the abort wins over the long timeout');
+        assert.equal((await blocking.callTool('http_echo', { text: 'still here' })).content, 'echo: still here');
+      } finally {
+        await blocking.close();
+      }
+
+      // SSE parsing: the reply is the last message with an id, and a partial
+      // data line is skipped rather than thrown.
+      assert.deepEqual(readSseMessage('event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\ndata: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}\n\n'), {
+        jsonrpc: '2.0',
+        id: 7,
+        result: { ok: true },
+      });
+      assert.equal(readSseMessage('data: not json\n\n'), undefined);
+      assert.deepEqual(readSseMessage('data: {"jsonrpc":"2.0","id":1,"result":null}\n\n'), {
+        jsonrpc: '2.0',
+        id: 1,
+        result: null,
+      });
+      assert.equal(readSseMessage(''), undefined);
+
+      // Through setupMcp: the entry starts, and /mcp names the url and timeout.
+      const dir = await tempDir('kiro-mcp-http-');
+      const home = path.join(dir, 'home');
+      await mkdir(path.join(dir, '.kiro'), { recursive: true });
+      await mkdir(path.join(home, '.kiro'), { recursive: true });
+      try {
+        await writeFile(
+          path.join(dir, '.kiro', 'mcp.json'),
+          JSON.stringify({
+            mcpServers: {
+              demo: { type: 'http', url, headers: { Authorization: 'Bearer test-token' }, timeout: 3_600_000 },
+              noUrl: { type: 'http' },
+            },
+          }),
+          'utf8',
+        );
+        const setup = await setupMcp(dir, { home });
+        try {
+          const demo = setup.statuses.find((status) => status.name === 'demo');
+          assert.equal(demo?.state, 'ready');
+          assert.equal(demo?.transport, 'http');
+          assert.equal(demo?.tools, 2);
+          assert.equal(setup.statuses.find((status) => status.name === 'noUrl')?.state, 'skipped');
+          const names = setup.definitions.map((definition) => definition.function.name).sort();
+          assert.deepEqual(names, ['mcp__demo__http_echo', 'mcp__demo__http_slow']);
+          const status = formatMcpStatus(setup, dir);
+          assert.match(status, new RegExp(`ok\\s+demo \\(2 tools\\)`));
+          assert.match(status, /timeout 3600s/);
+        } finally {
+          await setup.close();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+
+      // An unreachable URL is an error status, not a crash.
+      const dir2 = await tempDir('kiro-mcp-http-down-');
+      const home2 = path.join(dir2, 'home');
+      await mkdir(path.join(dir2, '.kiro'), { recursive: true });
+      try {
+        await writeFile(
+          path.join(dir2, '.kiro', 'mcp.json'),
+          JSON.stringify({ mcpServers: { down: { type: 'http', url: 'http://127.0.0.1:9/mcp' } } }),
+          'utf8',
+        );
+        const setup = await setupMcp(dir2, { home: home2 });
+        try {
+          assert.equal(setup.statuses[0]?.state, 'error');
+          assert.match(setup.statuses[0]?.detail ?? '', /failed over HTTP|could not reach/);
+          assert.equal(setup.tools.length, 0);
+        } finally {
+          await setup.close();
+        }
+      } finally {
+        await rm(dir2, { recursive: true, force: true });
+      }
+    } finally {
+      // Kill the fixture and drop its pipes, or the parent keeps the test run alive.
+      server.kill('SIGKILL');
+      server.stdout?.destroy();
+      server.stderr?.destroy();
+      server.unref();
+    }
+  });
+
+  await test('a broken MCP server is skipped instead of blocking the session', async () => {
+    const dir = await tempDir('kiro-mcp-broken-');
+    const home = path.join(dir, 'home');
+    await mkdir(path.join(dir, '.kiro'), { recursive: true });
+    await mkdir(path.join(home, '.kiro'), { recursive: true });
+    try {
+      await writeFile(
+        path.join(dir, '.kiro', 'mcp.json'),
+        JSON.stringify({
+          mcpServers: {
+            exits: { command: process.execPath, args: ['-e', 'process.exit(3)'] },
+            silent: { command: process.execPath, args: ['-e', 'setTimeout(() => {}, 60000)'] },
+          },
+        }),
+        'utf8',
+      );
+      const setup = await setupMcp(dir, { home });
+      try {
+        assert.equal(setup.tools.length, 0);
+        for (const status of setup.statuses) {
+          assert.equal(status.state, 'error');
+          assert.ok((status.detail ?? '').length > 0);
+        }
+        const exiting = setup.statuses.find((status) => status.name === 'exits');
+        assert.match(exiting?.detail ?? '', /exited with code 3|closed|timed out/);
+      } finally {
+        await setup.close();
+      }
+
+      // An MCP tool name never collides with a built-in one.
+      const setup2 = await setupMcp(dir, { home: path.join(dir, 'empty-home') });
+      assert.equal(setup2.tools.length, 0);
+      await setup2.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('run_command streams its newest output line and keeps the full result', async () => {
+    const dir = await tempDir('kiro-live-output-');
+    try {
+      const turns: MockTurn[] = [
+        {
+          type: 'tool-calls',
+          calls: [
+            {
+              name: 'run_command',
+              arguments: {
+                command: "printf 'first\\nsecond\\n'; printf 'oops\\n' 1>&2",
+                timeout_seconds: 30,
+              },
+            },
+          ],
+          usage: { prompt_tokens: 20, completion_tokens: 10 },
+        },
+        { type: 'text', text: 'Finished.' },
+      ];
+      const scenario = await runScenario({ cwd: dir, turns });
+      try {
+        const live = scenario.events.filter(
+          (event): event is Extract<AgentEvent, { type: 'tool-output' }> =>
+            event.type === 'tool-output',
+        );
+        assert.ok(live.length > 0, 'a command with output emits live updates');
+        assert.ok(
+          live.every((event) => event.tail.length <= 400),
+          'the live tail stays short',
+        );
+        assert.ok(
+          live.some((event) => /oops/.test(event.tail)),
+          'stderr is streamed too',
+        );
+        assert.equal(live.at(-1)?.toolCall.function.name, 'run_command');
+
+        const end = toolEnds(scenario.events)[0];
+        assert.match(end?.result.content ?? '', /first\nsecond/, 'stdout is still in the result');
+        assert.match(end?.result.content ?? '', /\[stderr\]\noops/);
+        // Live updates must not leak into the conversation the model sees.
+        const toolMessage = scenario.messages.find((message) => message.role === 'tool');
+        assert.match(toolMessage?.content ?? '', /exit code: 0/);
+        assert.ok(!(toolMessage?.content ?? '').includes('live'));
+      } finally {
+        await scenario.mock.close();
+      }
+
+      // A read-only tool never streams, and a silent command simply emits nothing.
+      const silent = await createMockServer({
+        turns: [
+          {
+            type: 'tool-calls',
+            calls: [{ name: 'run_command', arguments: { command: 'true' } }],
+          },
+          { type: 'text', text: 'ok' },
+        ],
+      });
+      try {
+        const spy = approvalSpy('allow');
+        const quiet = await collect(
+          runAgentTurn({
+            provider: makeProvider(silent.url),
+            messages: [
+              { role: 'system', content: 'test' },
+              { role: 'user', content: 'run it' },
+            ],
+            ctx: { cwd: dir, signal: new AbortController().signal, approve: spy.fn },
+          }),
+        );
+        assert.equal(
+          quiet.filter((event) => event.type === 'tool-output').length,
+          0,
+          'no output means no live events',
+        );
+      } finally {
+        await silent.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('the transcript and status bar show the live line while a command runs', async () => {
+    const running: ViewItem = {
+      kind: 'tool',
+      id: 1,
+      callId: 'call-1',
+      name: 'run_command',
+      argsSummary: 'pnpm build',
+      status: 'running',
+      liveTail: 'Compiling src/app.tsx',
+    };
+    const rendered = buildLines([running], 80)
+      .map((line) => `${line.prefix}${line.text}${line.suffix ? line.suffix.text : ''}`)
+      .join('\n');
+    assert.match(rendered, /Compiling src\/app\.tsx/);
+    assert.match(rendered, /running…/, 'the spinner state is still labelled');
+
+    const noTail = buildLines([{ ...running, liveTail: undefined }], 80)
+      .map((line) => `${line.prefix}${line.text}`)
+      .join('\n');
+    assert.doesNotMatch(noTail, /Compiling/);
+
+    const status = renderToString(
+      React.createElement(StatusBar, {
+        width: 100,
+        profile: 'openai',
+        model: 'gpt-4.1',
+        cwd: '/tmp/project',
+        activity: 'running',
+        toolName: 'run_command',
+        liveTail: 'Compiling src/app.tsx',
+      }),
+      { columns: 100 },
+    );
+    assert.match(status, /Compiling src\/app\.tsx/);
+    assert.doesNotMatch(status, /running run_command/, 'the output line replaces the tool label');
+
+    const idle = renderToString(
+      React.createElement(StatusBar, {
+        width: 100,
+        profile: 'openai',
+        model: 'gpt-4.1',
+        cwd: '/tmp/project',
+        activity: null,
+        liveTail: 'stale line',
+      }),
+      { columns: 100 },
+    );
+    assert.doesNotMatch(idle, /stale line/, 'an idle bar ignores a leftover tail');
+  });
+
+  await test('approval rules allow narrow patterns and always deny a chain', async () => {
+    const dir = await tempDir('kiro-rules-');
+    try {
+      assert.equal(matchesPattern('npm test*', 'npm test -- --watch'), true);
+      assert.equal(matchesPattern('npm test*', 'npm install'), false);
+      assert.equal(matchesPattern('src/*.ts', 'src/a/b.ts'), true, 'star crosses slashes');
+      assert.equal(matchesPattern('src/?.ts', 'src/ab.ts'), false, 'question mark is one character');
+
+      assert.deepEqual(splitCommand('a && b | c; d'), ['a', 'b', 'c', 'd']);
+      assert.deepEqual(splitCommand('echo "a;b" | grep a'), ['echo "a;b"', 'grep a']);
+      assert.equal(splitCommand('echo "unterminated'), null);
+
+      assert.equal(suggestRulePattern('run_command', 'npm test -- --watch'), 'npm test*');
+      assert.equal(suggestRulePattern('run_command', 'rm -rf build'), 'rm -rf build*');
+      assert.equal(suggestRulePattern('run_command', 'pnpm build && pnpm test'), '');
+      assert.equal(suggestRulePattern('edit_file', 'src/app.ts'), 'src/app.ts');
+
+      const allow: PermissionRule = { tool: 'run_command', match: 'npm test*', action: 'allow' };
+      assert.equal(evaluateRules([allow], { tool: 'run_command', subject: 'npm test' }), 'allow');
+      assert.equal(
+        evaluateRules([allow], { tool: 'run_command', subject: 'npm test; rm -rf ~' }),
+        'ask',
+        'a chain is not covered by one segment rule',
+      );
+      assert.equal(evaluateRules([allow], { tool: 'run_command', subject: 'npm install' }), 'ask');
+      assert.equal(evaluateRules([allow], { tool: 'run_command' }), 'ask');
+      assert.equal(
+        evaluateRules([allow, { tool: 'run_command', match: 'rm*', action: 'deny' }], {
+          tool: 'run_command',
+          subject: 'npm test',
+        }),
+        'allow',
+      );
+      assert.equal(
+        evaluateRules(
+          [
+            { tool: 'write_file', match: 'src/*', action: 'allow' },
+            { tool: 'write_file', match: 'src/secrets.ts', action: 'deny' },
+          ],
+          { tool: 'write_file', subject: 'src/secrets.ts' },
+        ),
+        'deny',
+        'a deny beats an allow on the same path',
+      );
+
+      assert.equal(evaluateRules([], { tool: 'run_command', subject: 'npm test' }), 'ask');
+
+      // Round trip through the project file.
+      assert.equal(permissionsPath(dir), path.join(dir, '.kiro', 'permissions.json'));
+      assert.deepEqual((await loadRules(dir)).rules, []);
+      const added = await addRule(dir, allow);
+      assert.equal(added.rules.length, 1);
+      const reread = await loadRules(dir);
+      assert.deepEqual(reread.rules, [allow]);
+
+      const replaced = await addRule(dir, { ...allow, action: 'deny' });
+      assert.deepEqual(
+        replaced.rules,
+        [{ tool: 'run_command', match: 'npm test*', action: 'deny' }],
+        'the same pattern is replaced, not duplicated',
+      );
+      await addRule(dir, allow);
+      // A rule is keyed by tool and pattern only, so the action does not matter here.
+      const removed = await removeRule(dir, { ...allow, action: 'deny' });
+      assert.deepEqual(removed.rules, []);
+      await clearRules(dir);
+      assert.deepEqual((await loadRules(dir)).rules, []);
+      assert.equal((await loadRules(dir)).problem, undefined);
+
+      await writeFile(path.join(dir, '.kiro', 'permissions.json'), '{ not json', 'utf8');
+      const broken = await loadRules(dir);
+      assert.deepEqual(broken.rules, []);
+      assert.match(broken.problem ?? '', /not valid JSON/);
+
+      await saveRules(dir, [allow, { tool: 'bad tool', match: 'x', action: 'allow' }, allow] as PermissionRule[]);
+      assert.deepEqual((await loadRules(dir)).rules, [allow], 'bad and duplicate entries are dropped');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('the approval prompt offers a saved rule and shows a denial', async () => {
+    const withRule = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'run_command', title: 'Run command', detail: '$ npm test', subject: 'npm test' },
+        width: 100,
+        rulePattern: 'npm test*',
+        onDecision: () => {},
+      }),
+      { columns: 100 },
+    );
+    assert.match(withRule, /\[s\] always allow npm test\*/);
+    assert.match(withRule, /\[d\] always deny this command/);
+    assert.match(withRule, /\[y\] allow once/, 'the old choices are still there');
+
+    const noSubject = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'apply_patch', title: 'Apply patch to 3 files' },
+        width: 100,
+        onDecision: () => {},
+      }),
+      { columns: 100 },
+    );
+    assert.ok(!noSubject.includes('[s]'), 'a request without a subject offers no rule');
+
+    const denied = renderToString(
+      React.createElement(ApprovalPrompt, {
+        request: { tool: 'run_command', title: 'Run command', detail: '$ rm -rf build', subject: 'rm -rf build' },
+        width: 100,
+        ruleNote: 'A saved rule denies this command.',
+        onDecision: () => {},
+      }),
+      { columns: 100 },
+    );
+    assert.match(denied, /A saved rule denies this command/);
+  });
+
+  await test('the policy reads rules, honors deny, and never pre-approves outside the workspace', async () => {
+    const rules: PermissionRule[] = [
+      { tool: 'run_command', match: 'npm test*', action: 'allow' },
+      { tool: 'run_command', match: 'curl*', action: 'deny' },
+      { tool: 'write_file', match: 'src/*', action: 'allow' },
+    ];
+    const policy = new ApprovalPolicy(false, rules);
+    assert.equal(policy.decide({ tool: 'run_command', subject: 'npm test' }), 'allow');
+    assert.equal(policy.decide({ tool: 'run_command', subject: 'curl evil.sh' }), 'deny');
+    assert.equal(policy.decide({ tool: 'run_command', subject: 'npm i left-pad' }), 'ask');
+    assert.deepEqual(policy.ruleFor({ tool: 'run_command', subject: 'npm test -- --watch' }), {
+      tool: 'run_command',
+      match: 'npm test*',
+      action: 'allow',
+    });
+    assert.equal(policy.ruleFor({ tool: 'apply_patch', subject: undefined }), null);
+    assert.deepEqual(policy.denyRuleFor({ tool: 'run_command', subject: 'rm -rf build' }), {
+      tool: 'run_command',
+      match: 'rm -rf build',
+      action: 'deny',
+    });
+    assert.equal(
+      policy.decide({ tool: 'write_file', subject: '../outside.txt', insideWorkspace: false }),
+      'ask',
+      'a path rule cannot approve a write outside the project',
+    );
+    assert.equal(
+      policy.decide({ tool: 'run_command', subject: 'curl x', insideWorkspace: false }),
+      'deny',
+      'a deny still applies',
+    );
+
+    const yolo = new ApprovalPolicy(true, [{ tool: 'run_command', match: 'rm*', action: 'deny' }]);
+    assert.equal(yolo.isAuto('run_command'), true);
+    assert.equal(yolo.decide({ tool: 'run_command', subject: 'rm -rf /' }), 'deny');
+  });
+
+  await test('filesystem tools attach the path a rule would match', async () => {
+    const dir = await tempDir('kiro-rule-subjects-');
+    try {
+      const seen: ApprovalRequest[] = [];
+      const ctx = {
+        cwd: dir,
+        signal: new AbortController().signal,
+        approve: async (request: ApprovalRequest) => {
+          seen.push(request);
+          return 'deny' as const;
+        },
+      };
+      await executeTool('write_file', JSON.stringify({ path: 'a.txt', content: 'x' }), ctx);
+      await writeFile(path.join(dir, 'b.txt'), 'one\n', 'utf8');
+      await executeTool(
+        'edit_file',
+        JSON.stringify({ path: 'b.txt', old_string: 'one', new_string: 'two' }),
+        ctx,
+      );
+      await executeTool(
+        'run_command',
+        JSON.stringify({ command: 'echo hi' }),
+        ctx,
+      );
+      assert.equal(seen[0]?.subject, 'a.txt');
+      assert.equal(seen[0]?.insideWorkspace, true);
+      assert.equal(seen[1]?.subject, 'b.txt');
+      assert.equal(seen[2]?.subject, 'echo hi');
+      assert.ok(seen.every((request) => request.detail !== undefined), 'the preview is still shown');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('cost estimates follow the price table and the profile override', async () => {
+    assert.deepEqual(priceFor('gpt-4o-mini'), { input: 0.15, output: 0.6 });
+    assert.deepEqual(priceFor('openai/gpt-4o-mini'), { input: 0.15, output: 0.6 }, 'vendor prefixes are ignored');
+    assert.deepEqual(priceFor('anthropic/claude-3.5-sonnet'), { input: 3, output: 15 });
+    assert.deepEqual(priceFor('qwen2.5-coder:14b', 'http://localhost:11434/v1'), { input: 0, output: 0 });
+    assert.equal(priceFor('mystery-model-9000'), null);
+
+    const usage = { promptTokens: 1_000_000, completionTokens: 100_000 };
+    assert.equal(costOf(usage, { input: 2, output: 8 }), 2.8);
+    assert.equal(formatCost(0), '$0');
+    assert.equal(formatCost(0.0042), '$0.0042');
+    assert.equal(formatCost(0.42), '$0.420');
+    assert.equal(formatCost(12.3456), '$12.35');
+
+    const one = addCost({ dollars: 0, complete: true }, usage, { input: 2, output: 8 });
+    assert.equal(one.dollars, 2.8);
+    const unpriced = addCost(one, usage, null);
+    assert.deepEqual(unpriced, { dollars: 2.8, complete: false }, 'an unpriced request marks the total');
+    assert.deepEqual(sessionCost({ promptTokens: 0, completionTokens: 0, requests: 0 }, null), {
+      dollars: 0,
+      complete: true,
+    });
+    assert.deepEqual(sessionCost({ promptTokens: 1_000_000, completionTokens: 0, requests: 1 }, { input: 3, output: 15 }), {
+      dollars: 3,
+      complete: true,
+    });
+
+    const card = renderToString(
+      React.createElement(UsageCard, {
+        usage: { promptTokens: 54_000, completionTokens: 2_400, requests: 3 },
+        contextTokens: 12_000,
+        contextWindow: 128_000,
+        contextEstimated: false,
+        cost: { dollars: 0.0412, complete: true },
+        busy: false,
+      }),
+      { columns: USAGE_CARD_WIDTH },
+    );
+    assert.match(card, /\$0\.041 est\./, 'a sub-dollar cost keeps three decimals');
+    const approx = renderToString(
+      React.createElement(UsageCard, {
+        usage: { promptTokens: 1_000, completionTokens: 1_000, requests: 1 },
+        contextTokens: 0,
+        contextWindow: 8_000,
+        contextEstimated: false,
+        cost: { dollars: 0.5, complete: false },
+        busy: false,
+      }),
+      { columns: USAGE_CARD_WIDTH },
+    );
+    assert.match(approx, /~\$0\.500/, 'an unpriced request marks the total approximate');
+  });
+
   await test('approval policy tracks session allowances and yolo', async () => {
     const policy = new ApprovalPolicy(false);
     assert.equal(policy.isAuto('run_command'), false);
@@ -2234,6 +3359,7 @@ async function main(): Promise<void> {
     );
     assert.deepEqual(filterSlashCommands('/m').map((command) => command.name), [
       '/model',
+      '/mcp',
       '/mouse',
     ]);
     assert.deepEqual(filterSlashCommands('/ex').map((command) => command.name), [
@@ -2946,6 +4072,7 @@ async function main(): Promise<void> {
         'sk-wizard-secret-1234',
         '1',
         'wizard-model',
+        '', // no extra request headers
         'n',
         'y',
       ]);
@@ -2963,7 +4090,7 @@ async function main(): Promise<void> {
       await assertPrivateMode(envFile, 0o600);
       assert.ok(!(await readFile(configFile, 'utf8')).includes('sk-wizard-secret'));
 
-      const editUi = new ScriptedUi(['3', 'wizard-changed', '8', '64000', '9']);
+      const editUi = new ScriptedUi(['3', 'wizard-changed', '8', '64000', '10']);
       const editCtx = {
         ui: editUi,
         config: addCtx.config,
@@ -3011,6 +4138,7 @@ async function main(): Promise<void> {
         '',
         'manual-model',
         'manual-profile',
+        '', // no extra request headers
         'n',
         'n',
       ]);
@@ -3743,6 +4871,49 @@ async function main(): Promise<void> {
       const piped = await runCli(['-p', '-', '--yolo'], 'Say hello.');
       assert.equal(piped.status, 0, piped.stderr);
       assert.match(piped.stdout, /All done\./);
+
+      // A saved rule is enough for headless mode, so CI can run one narrow command.
+      const ruleMock = await createMockServer({
+        turns: [
+          {
+            type: 'tool-calls',
+            calls: [{ name: 'write_file', arguments: { path: 'headless.txt', content: 'from headless\n' } }],
+            usage: { prompt_tokens: 50, completion_tokens: 5 },
+          },
+          { type: 'text', text: 'All done.', usage: { prompt_tokens: 60, completion_tokens: 7 } },
+        ],
+      });
+      await writeFile(
+        configFile,
+        JSON.stringify({
+          activeProfile: 'mock',
+          profiles: {
+            mock: {
+              type: 'openai',
+              baseUrl: ruleMock.url,
+              model: 'mock-model',
+              apiKeyEnv: 'KIRO_HEADLESS_KEY',
+              temperature: 0,
+              maxTokens: 1024,
+            },
+          },
+        }),
+      );
+      await mkdir(path.join(project, '.kiro'), { recursive: true });
+      await writeFile(
+        path.join(project, '.kiro', 'permissions.json'),
+        JSON.stringify({ version: 1, rules: [{ tool: 'write_file', match: 'headless.txt', action: 'allow' }] }),
+        'utf8',
+      );
+      await rm(path.join(project, 'headless.txt'), { force: true });
+      const ruled = await runCli(['-p', 'Create the file.']);
+      assert.equal(ruled.status, 0, ruled.stderr);
+      assert.equal(await readFile(path.join(project, 'headless.txt'), 'utf8'), 'from headless\n');
+      assert.doesNotMatch(ruled.stderr, /denied/, 'a saved rule approves without --yolo');
+      assert.match(ruled.stderr, /usage: .*~\$/, 'headless reports the estimated cost');
+      await rm(path.join(project, '.kiro', 'permissions.json'), { force: true });
+      await rm(path.join(project, 'headless.txt'), { force: true });
+      await ruleMock.close();
 
       const noTty = await runCli([]);
       assert.equal(noTty.status, 2);

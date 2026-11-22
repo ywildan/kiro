@@ -205,6 +205,7 @@ async function networkChecks(
   const result = await discoverModels({
     baseUrl: profile.baseUrl,
     apiKey,
+    headers: profile.headers,
     timeoutMs: 5000,
   });
   const latency = formatDuration(Math.max(0, Math.round(performance.now() - started)));

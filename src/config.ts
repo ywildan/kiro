@@ -16,6 +16,16 @@ export interface ProfileConfig {
   maxTokens?: number;
   /** Approximate model context window in tokens; used for the ctx meter and compaction. */
   contextWindow?: number;
+  /**
+   * Extra headers sent with every request, for gateways that need a routing or
+   * API-version header. Values may use `${VAR}` to read the environment.
+   */
+  headers?: Record<string, string>;
+  /**
+   * Overrides the built-in price table for this model, in dollars per million
+   * tokens. Set it for a private or resold endpoint where the list price is wrong.
+   */
+  pricing?: { input: number; output: number };
 }
 
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -143,6 +153,95 @@ function validateModels(name: string, raw: unknown, model: string): string[] | u
   return models;
 }
 
+const MAX_HEADERS = 24;
+const HEADER_NAME_PATTERN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+
+/** Names that would break the request or duplicate the key; both go through other fields. */
+const RESERVED_HEADERS = new Set([
+  'content-type',
+  'content-length',
+  'accept',
+  'authorization',
+  'host',
+  'connection',
+  'transfer-encoding',
+]);
+
+/**
+ * Parses one `Name: value` line, the form both the wizard and `kiro model add
+ * --header` accept. Values may use `${VAR}` to read the environment.
+ */
+export function parseHeaderEntry(text: string): { name: string; value: string } {
+  const trimmed = text.trim();
+  const colon = trimmed.indexOf(':');
+  if (colon <= 0) {
+    throw new ConfigError('Write a header as "Name: value", for example "api-key: ${AZURE_KEY}".');
+  }
+  const name = trimmed.slice(0, colon).trim();
+  const value = trimmed.slice(colon + 1).trim();
+  if (!HEADER_NAME_PATTERN.test(name)) {
+    throw new ConfigError(`"${name}" is not a valid header name.`);
+  }
+  if (!value) throw new ConfigError(`Header "${name}" needs a value.`);
+  if (/[\r\n]/.test(value)) throw new ConfigError(`Header "${name}" must stay on one line.`);
+  if (RESERVED_HEADERS.has(name.toLowerCase())) {
+    throw new ConfigError(
+      `Header "${name}" is set by Kiro. Use "apiKeyEnv" for the key; the other headers are managed automatically.`,
+    );
+  }
+  return { name, value };
+}
+
+export function validateHeaders(profileName: string, raw: unknown): Record<string, string> | undefined {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) {
+    throw new ConfigError(`Profile "${profileName}": "headers" must be an object of string values.`);
+  }
+  const entries = Object.entries(raw);
+  if (entries.length > MAX_HEADERS) {
+    throw new ConfigError(`Profile "${profileName}": "headers" may hold at most ${MAX_HEADERS} entries.`);
+  }
+  const headers: Record<string, string> = {};
+  for (const [name, value] of entries) {
+    if (!HEADER_NAME_PATTERN.test(name)) {
+      throw new ConfigError(`Profile "${profileName}": "${name}" is not a valid header name.`);
+    }
+    if (typeof value !== 'string' || value.includes('\n') || value.includes('\r')) {
+      throw new ConfigError(
+        `Profile "${profileName}": header "${name}" must be a single-line string.`,
+      );
+    }
+    if (RESERVED_HEADERS.has(name.toLowerCase())) {
+      throw new ConfigError(
+        `Profile "${profileName}": header "${name}" is set by Kiro. ` +
+          'Use "apiKeyEnv" for the key; the other headers are managed automatically.',
+      );
+    }
+    headers[name] = value;
+  }
+  return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function validatePricing(
+  profileName: string,
+  raw: unknown,
+): { input: number; output: number } | undefined {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw)) {
+    throw new ConfigError(`Profile "${profileName}": "pricing" must be an object.`);
+  }
+  const read = (key: 'input' | 'output'): number => {
+    const value = raw[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new ConfigError(
+        `Profile "${profileName}": "pricing.${key}" must be a non-negative number (dollars per million tokens).`,
+      );
+    }
+    return value;
+  };
+  return { input: read('input'), output: read('output') };
+}
+
 function validateProfile(name: string, raw: unknown): ProfileConfig {
   if (!isRecord(raw)) {
     throw new ConfigError(`Profile "${name}" must be an object.`);
@@ -191,6 +290,8 @@ function validateProfile(name: string, raw: unknown): ProfileConfig {
     temperature: raw.temperature as number | undefined,
     maxTokens: raw.maxTokens as number | undefined,
     contextWindow: raw.contextWindow as number | undefined,
+    headers: validateHeaders(name, raw.headers),
+    pricing: validatePricing(name, raw.pricing),
   };
 }
 
@@ -346,6 +447,10 @@ export async function saveConfig(config: KiroConfig, options: SaveConfigOptions 
     else delete merged.contextWindow;
     if (profile.models !== undefined) merged.models = profile.models;
     else delete merged.models;
+    if (profile.headers !== undefined) merged.headers = profile.headers;
+    else delete merged.headers;
+    if (profile.pricing !== undefined) merged.pricing = profile.pricing;
+    else delete merged.pricing;
     profiles[name] = merged;
   }
 

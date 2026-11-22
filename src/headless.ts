@@ -22,6 +22,8 @@ import {
   type SessionRecord,
 } from './sessions.js';
 import { redactSecrets } from './secrets.js';
+import { evaluateRules, loadRules } from './permissions.js';
+import { costOf, formatCost, priceFor } from './cost.js';
 import { addUsage, normalizeUsage } from './usage.js';
 
 export interface HeadlessOptions {
@@ -92,17 +94,27 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
   }
 
   const warnedTools = new Set<string>();
+  // Saved rules let CI approve a narrow pattern (say "npm test*") without --yolo.
+  const rules = yolo ? [] : (await loadRules(cwd)).rules;
   const ctx: ToolContext = {
     cwd,
     signal: options.signal,
     approve: yolo
       ? () => Promise.resolve('allow')
       : (request) => {
-          if (!warnedTools.has(request.tool)) {
-            warnedTools.add(request.tool);
+          const verdict =
+            request.insideWorkspace === false
+              ? 'ask'
+              : evaluateRules(rules, { tool: request.tool, subject: request.subject });
+          if (verdict === 'allow') return Promise.resolve('allow');
+          const key = verdict === 'deny' ? `${request.tool}:deny` : request.tool;
+          if (!warnedTools.has(key)) {
+            warnedTools.add(key);
             stderr.write(
-              `# ${request.tool} denied: headless runs never approve tool calls. ` +
-                `Run Kiro interactively, or pass --yolo to allow every tool.\n`,
+              verdict === 'deny'
+                ? `# ${request.tool} denied: a saved rule in .kiro/permissions.json refuses it.\n`
+                : `# ${request.tool} denied: headless runs never approve tool calls. ` +
+                    'Run Kiro interactively, or pass --yolo to allow every tool.\n',
             );
           }
           return Promise.resolve('deny');
@@ -215,6 +227,14 @@ export async function runHeadless(options: HeadlessOptions): Promise<number> {
     flushReasoning();
     // Keep shell prompts and piped files tidy without altering the model's text.
     if (lastTextChar && lastTextChar !== '\n') writeOut('\n');
+
+    const price = profile.pricing ?? priceFor(profile.model, profile.baseUrl);
+    if (price && usage.requests > 0) {
+      stderr.write(
+        `# usage: ${usage.promptTokens} sent, ${usage.completionTokens} received, ` +
+          `~${formatCost(costOf(usage, price))}\n`,
+      );
+    }
 
     const cleaned = dropIncompleteToolCalls(working.filter((message) => message.role !== 'system'));
     if (cleaned.length > 0) {

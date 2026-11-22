@@ -10,6 +10,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', description: 'show this help' },
   { name: '/model', usage: '[name | add | edit | remove | test | list]', description: 'list or switch models' },
   { name: '/skills', description: 'list installed skills and where they were found' },
+  { name: '/mcp', description: 'list MCP servers, their tools, and any startup errors' },
   { name: '/skill', usage: '<name> [request]', description: 'load a skill and apply it to your next request' },
   { name: '/context', description: 'show approximate context usage' },
   { name: '/usage', description: 'show or hide the usage card' },
@@ -21,6 +22,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/export', usage: '[file]', description: 'write the transcript to a Markdown file' },
   { name: '/mouse', description: 'toggle mouse reporting (wheel scroll vs text selection)' },
   { name: '/allow', usage: '[clear]', description: 'manage tools that skip approval' },
+  { name: '/rules', usage: '[clear | remove <n>]', description: 'saved approval rules in .kiro/permissions.json' },
   { name: '/exit', description: 'quit Kiro' },
 ];
 

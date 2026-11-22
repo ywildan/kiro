@@ -48,6 +48,8 @@ export interface ToolItem {
   resultSummary?: string;
   /** Full result text, shown by Ctrl+O. */
   resultFull?: string;
+  /** Last output line while the command runs; replaced by the result when it ends. */
+  liveTail?: string;
   durationMs?: number;
 }
 

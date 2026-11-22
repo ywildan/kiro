@@ -182,6 +182,9 @@ const applyPatchTool: Tool = {
             .map((file) => file.abs)
             .join(', ')}`
         : undefined,
+      // A rule covers one path, so a multi-file patch stays manual.
+      subject: planned.length === 1 ? planned[0]!.display : undefined,
+      insideWorkspace: !planned.some((file) => file.outside),
     };
     if (!(await requestApproval(ctx, request))) return denied();
     if (ctx.signal.aborted) return denied('Cancelled by user.');

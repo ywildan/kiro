@@ -89,6 +89,8 @@ import { formatProfileList } from './profile-list.js';
 import { loadPromptHistory, recordPrompt } from './prompt-history.js';
 import { StatusBar, type Activity } from './StatusBar.js';
 import { summarizeToolArgs } from './text.js';
+import { MAX_PREVIEW_LINES } from './approval-preview.js';
+import { formatMcpStatus, type McpSetup } from '../mcp/registry.js';
 import {
   UsageCard,
   USAGE_CARD_GAP,
@@ -97,7 +99,23 @@ import {
   type LastReplyStats,
 } from './UsageCard.js';
 import { addUsage, EMPTY_USAGE, type UsageTotals } from '../usage.js';
+import { formatCost } from '../cost.js';
+import {
+  addCost,
+  priceFor,
+  sessionCost as restoredCost,
+  type ModelPrice,
+  type SessionCost,
+} from '../cost.js';
 import { undoLastCheckpoint } from '../tools/checkpoint.js';
+import {
+  addRule,
+  clearRules,
+  loadRules,
+  permissionsPath,
+  removeRule,
+  type PermissionRule,
+} from '../permissions.js';
 import {
   MAX_EXPANDED_TOOL_CHARS,
   MAX_REASONING_CHARS,
@@ -129,6 +147,8 @@ interface AppProps {
   mouseEnabled: boolean;
   initialSession?: SessionRecord | null;
   startupNotices?: StartupNotice[];
+  /** MCP servers that started for this session; null when MCP is off. */
+  mcp?: McpSetup | null;
 }
 
 interface WizardPromptState extends TextPrompt {
@@ -175,6 +195,7 @@ export function App({
   mouseEnabled,
   initialSession,
   startupNotices,
+  mcp,
 }: AppProps): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
@@ -209,6 +230,8 @@ export function App({
   const [wizardPrompt, setWizardPrompt] = useState<WizardPromptState | null>(null);
   const [wizardActive, setWizardActive] = useState(false);
   const [activeTool, setActiveTool] = useState<string | null>(null);
+  /** Newest output line of the running command, shown in the status bar. */
+  const [liveTail, setLiveTail] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
   const [pendingQuestion, setPendingQuestion] = useState<AskUserRequest | null>(null);
@@ -242,6 +265,16 @@ export function App({
     () => initialSession?.usage ?? EMPTY_USAGE,
   );
   const sessionUsageRef = useRef(sessionUsage);
+  /** Running cost estimate; `complete` turns false once a request had no known price. */
+  const [sessionCost, setSessionCost] = useState<SessionCost>({ dollars: 0, complete: true });
+  const sessionCostRef = useRef(sessionCost);
+  /** Price of the active profile's model; a profile `pricing` entry wins over the table. */
+  const profilePricing = config.profiles[profileName]?.pricing;
+  const currentPrice = profilePricing ?? priceFor(config.profiles[profileName]?.model ?? '', config.profiles[profileName]?.baseUrl);
+  const currentPriceRef = useRef<ModelPrice | null>(currentPrice);
+  currentPriceRef.current = currentPrice;
+  const priceRef = currentPriceRef;
+  const hasPrice = currentPrice !== null;
   const [lastReply, setLastReply] = useState<LastReplyStats | null>(null);
   const [contextTokens, setContextTokens] = useState(() => estimateMessagesTokens(messagesRef.current));
   const contextTokensRef = useRef(contextTokens);
@@ -279,6 +312,10 @@ export function App({
   const quitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [approvalPolicy] = useState(() => new ApprovalPolicy(yolo));
   const [autoAllowed, setAutoAllowed] = useState<string[]>([]);
+  /** Saved rules for this project; empty until the first read finishes. */
+  const [savedRules, setSavedRules] = useState<PermissionRule[]>([]);
+  /** Set when a saved rule refused the pending request. */
+  const [ruleNote, setRuleNote] = useState<string | null>(null);
   const pendingApprovalRef = useRef<ApprovalRequest | null>(null);
   const pendingResolverRef = useRef<((decision: ApprovalDecision) => void) | null>(null);
   const pendingQuestionRef = useRef<AskUserRequest | null>(null);
@@ -298,6 +335,23 @@ export function App({
       { kind: 'notice', id: nextItemIdRef.current++, level, text },
     ]);
   }, []);
+
+  /** Reads this project's saved rules; a broken file reports once and never blocks a turn. */
+  const refreshRules = useCallback(
+    async (report = false): Promise<PermissionRule[]> => {
+      const set = await loadRules(cwd);
+      if (set.problem && report) addNotice('error', set.problem);
+      approvalPolicy.setRules(set.rules);
+      setSavedRules(set.rules);
+      return set.rules;
+    },
+    [addNotice, approvalPolicy, cwd],
+  );
+
+  // Rules live in the project, so a resumed session in another directory reloads them.
+  useEffect(() => {
+    void refreshRules();
+  }, [refreshRules]);
 
   const updateContextTokens = useCallback((tokens: number): void => {
     const rounded = Math.max(0, Math.round(tokens));
@@ -409,7 +463,11 @@ export function App({
       if (profile.apiKeyEnv && !key) {
         return { ok: false, message: `API key is missing: $${profile.apiKeyEnv} is not set.` };
       }
-      const result = await discoverModels({ baseUrl: profile.baseUrl, apiKey: key });
+      const result = await discoverModels({
+        baseUrl: profile.baseUrl,
+        apiKey: key,
+        headers: profile.headers,
+      });
       if (!result.ok) return { ok: false, message: result.message };
       if (result.models.length === 0) {
         return { ok: false, message: 'The endpoint returned an empty model list.' };
@@ -647,32 +705,70 @@ export function App({
     });
   }, []);
 
-  const resolveApproval = useCallback((decision: ApprovalDecision): void => {
-    const request = pendingApprovalRef.current;
-    const resolver = pendingResolverRef.current;
-    pendingApprovalRef.current = null;
-    pendingResolverRef.current = null;
-    setPendingApproval(null);
-    if (!request || !resolver) return;
-    if (decision === 'allow-session') {
-      approvalPolicy.markSession(request.tool);
-      setAutoAllowed(approvalPolicy.list());
-      addNotice(
-        'info',
-        `${request.tool} will run without asking. Use /allow to list, /allow clear to revoke.`,
-      );
-    }
-    resolver(decision);
-  }, [addNotice, approvalPolicy]);
+  const resolveApproval = useCallback(
+    (decision: ApprovalDecision): void => {
+      const request = pendingApprovalRef.current;
+      const resolver = pendingResolverRef.current;
+      pendingApprovalRef.current = null;
+      pendingResolverRef.current = null;
+      setPendingApproval(null);
+      setRuleNote(null);
+      if (!request || !resolver) return;
+
+      const saveRule = (rule: PermissionRule | null, note: (path: string) => string): void => {
+        if (!rule) return;
+        void addRule(cwd, rule)
+          .then((set) => {
+            approvalPolicy.setRules(set.rules);
+            setSavedRules(set.rules);
+            addNotice('info', note(set.path));
+          })
+          .catch((error: unknown) => {
+            addNotice(
+              'error',
+              `Could not save the rule: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          });
+      };
+
+      if (decision === 'allow-session') {
+        approvalPolicy.markSession(request.tool);
+        setAutoAllowed(approvalPolicy.list());
+        addNotice(
+          'info',
+          `${request.tool} will run without asking. Use /allow to list, /allow clear to revoke.`,
+        );
+      } else if (decision === 'allow-rule') {
+        saveRule(
+          approvalPolicy.ruleFor(request),
+          (file) =>
+            `Saved ${approvalPolicy.ruleFor(request)?.match} to ${file}. Edit or delete it with /rules.`,
+        );
+      } else if (decision === 'deny-rule') {
+        saveRule(
+          approvalPolicy.denyRuleFor(request),
+          (file) => `Added a deny rule for ${request.subject} to ${file}. /rules lists and removes it.`,
+        );
+      }
+      resolver(decision === 'allow-rule' ? 'allow' : decision === 'deny-rule' ? 'deny' : decision);
+    },
+    [addNotice, approvalPolicy, cwd],
+  );
 
   const approve = useCallback(
     (request: ApprovalRequest): Promise<ApprovalDecision> => {
-      if (approvalPolicy.isAuto(request.tool)) return Promise.resolve('allow');
+      const verdict = approvalPolicy.decide(request);
+      if (verdict === 'allow') return Promise.resolve('allow');
       if (abortRef.current?.signal.aborted) return Promise.resolve('deny');
       return new Promise<ApprovalDecision>((resolve) => {
         pendingApprovalRef.current = request;
         pendingResolverRef.current = resolve;
         setPendingApproval(request);
+        setRuleNote(
+          verdict === 'deny'
+            ? `A saved rule denies this ${request.tool === 'run_command' ? 'command' : 'path'}.`
+            : null,
+        );
       });
     },
     [approvalPolicy],
@@ -867,8 +963,23 @@ export function App({
                 },
               ]);
               break;
+            case 'tool-output':
+              setLiveTail(event.tail);
+              setItems((current) => {
+                const index = current.findIndex(
+                  (item) => item.kind === 'tool' && item.callId === event.toolCall.id,
+                );
+                if (index === -1) return current;
+                const item = current[index];
+                if (item?.kind !== 'tool' || item.liveTail === event.tail) return current;
+                const next = [...current];
+                next[index] = { ...item, liveTail: event.tail };
+                return next;
+              });
+              break;
             case 'tool-end':
               setActiveTool(null);
+              setLiveTail(null);
               setItems((current) => {
                 const index = current.findIndex(
                   (item) => item.kind === 'tool' && item.callId === event.toolCall.id && item.status === 'running',
@@ -880,6 +991,7 @@ export function App({
                 next[index] = {
                   ...item,
                   status: event.result.status,
+                  liveTail: undefined,
                   resultSummary: event.result.summary,
                   resultFull: event.result.content.slice(0, MAX_EXPANDED_TOOL_CHARS),
                   durationMs: event.durationMs,
@@ -909,6 +1021,9 @@ export function App({
               const totals = addUsage(sessionUsageRef.current, event.usage);
               sessionUsageRef.current = totals;
               setSessionUsage(totals);
+              const priced = addCost(sessionCostRef.current, event.usage, currentPriceRef.current);
+              sessionCostRef.current = priced;
+              setSessionCost(priced);
               roundCompletionTokensRef.current = event.usage.completionTokens;
               recomputeContext();
               break;
@@ -1033,7 +1148,11 @@ export function App({
         return;
       }
       addNotice('muted', `Fetching models from ${profile.baseUrl}…`);
-      const result = await discoverModels({ baseUrl: profile.baseUrl, apiKey: key });
+      const result = await discoverModels({
+        baseUrl: profile.baseUrl,
+        apiKey: key,
+        headers: profile.headers,
+      });
       if (!result.ok) {
         addNotice('error', result.message);
         return;
@@ -1081,6 +1200,9 @@ export function App({
       const restoredUsage = record.usage ?? EMPTY_USAGE;
       sessionUsageRef.current = restoredUsage;
       setSessionUsage(restoredUsage);
+      const restored = restoredCost(restoredUsage, priceRef.current);
+      sessionCostRef.current = restored;
+      setSessionCost(restored);
       setLastReply(null);
       recomputeContext();
       sessionRef.current = {
@@ -1235,6 +1357,10 @@ export function App({
                 ? `Session usage: ↑ ${formatTokens(totals.promptTokens)} sent, ↓ ${formatTokens(totals.completionTokens)} received ` +
                   `across ${totals.requests} API request${totals.requests === 1 ? '' : 's'} (saved with this session).`
                 : 'Session usage: the endpoint has not reported token counts for this session yet.',
+              hasPrice
+                ? `Estimated cost: ${sessionCost.complete ? '' : '~'}${formatCost(sessionCost.dollars)} ` +
+                  `($${currentPrice.input}/M in, $${currentPrice.output}/M out${profilePricing ? ', from the profile' : ', list price'}).`
+                : 'Cost: no known list price for this model. Set "pricing" in the profile to track it.',
               `Auto-compaction runs at ${Math.round(COMPACT_THRESHOLD * 100)}% and keeps the last ${COMPACT_KEEP_USER_TURNS} user turns verbatim. /compact runs it now.`,
             ].join('\n'),
           );
@@ -1470,6 +1596,8 @@ export function App({
             usageRef.current = null;
             sessionUsageRef.current = EMPTY_USAGE;
             setSessionUsage(EMPTY_USAGE);
+            sessionCostRef.current = { dollars: 0, complete: true };
+            setSessionCost(sessionCostRef.current);
             setLastReply(null);
             updateContextTokens(0);
             sessionRef.current = null;
@@ -1537,6 +1665,64 @@ export function App({
             next
               ? 'Mouse reporting on: the wheel scrolls the transcript, but text selection needs Shift+drag.'
               : 'Mouse reporting off: click-drag selects text normally; use PgUp/PgDn to scroll.',
+          );
+          return;
+        }
+        case '/mcp': {
+          if (argument) {
+            addNotice('error', 'Usage: /mcp (lists configured servers for this session)');
+            return;
+          }
+          addNotice('info', formatMcpStatus(mcp ?? null, cwd));
+          return;
+        }
+        case '/rules': {
+          const rules = await refreshRules(true);
+          if (argument === 'clear') {
+            try {
+              const file = await clearRules(cwd);
+              approvalPolicy.setRules([]);
+              setSavedRules([]);
+              addNotice('info', `Removed ${file}. Every tool asks for approval again.`);
+            } catch (error) {
+              addNotice('error', `Could not clear the rules: ${(error as Error).message}`);
+            }
+            return;
+          }
+          if (argument?.startsWith('remove ')) {
+            const index = Number(argument.slice('remove '.length).trim());
+            const rule = rules[index - 1];
+            if (!Number.isInteger(index) || !rule) {
+              addNotice('error', `Usage: /rules remove <n>, where n is 1-${rules.length}.`);
+              return;
+            }
+            try {
+              const set = await removeRule(cwd, rule);
+              approvalPolicy.setRules(set.rules);
+              setSavedRules(set.rules);
+              addNotice('info', `Removed "${rule.match}" for ${rule.tool}. ${set.rules.length} rules left.`);
+            } catch (error) {
+              addNotice('error', `Could not remove the rule: ${(error as Error).message}`);
+            }
+            return;
+          }
+          if (argument) {
+            addNotice('error', 'Usage: /rules, /rules remove <n>, or /rules clear');
+            return;
+          }
+          const numbered = rules.map(
+            (rule, index) => `  ${index + 1}. ${rule.action} ${rule.tool} ~ ${rule.match}`,
+          );
+          addNotice(
+            'info',
+            rules.length === 0
+              ? `No saved rules for this project. Choose [s] on an approval prompt to allow a pattern, or [d] to deny one.\nRules live in ${permissionsPath(cwd)}.`
+              : [
+                  `Saved rules (${permissionsPath(cwd)}):`,
+                  ...numbered,
+                  '',
+                  '/rules remove <n> deletes one; /rules clear deletes the file.',
+                ].join('\n'),
           );
           return;
         }
@@ -1885,6 +2071,7 @@ export function App({
               contextWindow={contextWindow}
               contextEstimated={usageRef.current === null}
               lastReply={lastReply}
+              cost={hasPrice ? sessionCost : undefined}
               busy={busy}
             />
           </Box>
@@ -1894,6 +2081,11 @@ export function App({
         <ApprovalPrompt
           request={pendingApproval}
           width={width}
+          rulePattern={approvalPolicy.ruleFor(pendingApproval)?.match}
+          ruleNote={ruleNote ?? undefined}
+          maxPreviewLines={
+            rows - 5 - extraInputRows - 12 >= 16 ? MAX_PREVIEW_LINES : 3
+          }
           onDecision={resolveApproval}
         />
       ) : questionInline && pendingQuestion ? (
@@ -1964,6 +2156,7 @@ export function App({
         cwd={cwd}
         activity={activity}
         toolName={activeTool ?? undefined}
+        liveTail={liveTail}
         busySince={busySince ?? undefined}
         queued={queuedCount > 0 ? queuedCount : undefined}
         yolo={yolo}

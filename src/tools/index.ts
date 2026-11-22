@@ -6,6 +6,7 @@ import { patchTools } from './patch.js';
 import { searchTools } from './search.js';
 import { runCommandTool } from './shell.js';
 import { skillTools } from './skill.js';
+import { extraTools } from './registry.js';
 import type { Tool, ToolContext, ToolResult } from './types.js';
 import { toolError } from './types.js';
 
@@ -22,10 +23,24 @@ export const tools: Tool[] = [
 
 export const toolDefinitions: ToolDefinition[] = tools.map((tool) => tool.definition);
 
-const byName = new Map(tools.map((tool) => [tool.definition.function.name, tool]));
+/** Built-in tools plus any MCP tools registered after startup. */
+export function allTools(): Tool[] {
+  return [...tools, ...extraTools()];
+}
+
+export function allToolDefinitions(): ToolDefinition[] {
+  return [...toolDefinitions, ...extraTools().map((tool) => tool.definition)];
+}
+
+function findTool(name: string): Tool | undefined {
+  return (
+    tools.find((tool) => tool.definition.function.name === name) ??
+    extraTools().find((tool) => tool.definition.function.name === name)
+  );
+}
 
 export function isReadOnlyTool(name: string): boolean {
-  return byName.get(name)?.readOnly === true;
+  return findTool(name)?.readOnly === true;
 }
 
 /** Strips registered credentials so they cannot reach the model or a saved session. */
@@ -60,10 +75,12 @@ export async function executeTool(
   rawArguments: string,
   ctx: ToolContext,
 ): Promise<ToolResult> {
-  const tool = byName.get(name);
+  const tool = findTool(name);
   if (!tool) {
     return toolError(
-      `Unknown tool "${name}". Available tools: ${[...byName.keys()].join(', ')}.`,
+      `Unknown tool "${name}". Available tools: ${allTools()
+        .map((entry) => entry.definition.function.name)
+        .join(', ')}.`,
     );
   }
 
@@ -90,4 +107,5 @@ export async function executeTool(
   }
 }
 
+export { setExtraTools, extraTools } from './registry.js';
 export type { Tool, ToolContext, ToolResult } from './types.js';

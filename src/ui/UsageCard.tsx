@@ -2,6 +2,7 @@ import React from 'react';
 import { Box, Text } from 'ink';
 import { formatPercent, formatTokens } from '../agent/tokens.js';
 import type { UsageTotals } from '../usage.js';
+import { formatCost } from '../cost.js';
 import { formatDuration, truncateToWidth } from './text.js';
 
 export const USAGE_CARD_WIDTH = 27;
@@ -35,6 +36,8 @@ interface UsageCardProps {
   /** True while the context count comes from the character estimate, not the endpoint. */
   contextEstimated: boolean;
   lastReply?: LastReplyStats | null;
+  /** Session cost in dollars, or undefined when the model has no known price. */
+  cost?: { dollars: number; complete: boolean } | undefined;
   busy: boolean;
   width?: number;
 }
@@ -45,6 +48,7 @@ export function UsageCard({
   contextWindow,
   contextEstimated,
   lastReply,
+  cost,
   busy,
   width = USAGE_CARD_WIDTH,
 }: UsageCardProps): React.JSX.Element {
@@ -92,6 +96,12 @@ export function UsageCard({
         <Text>  </Text>
         <Text color="blue">↓ {completion}</Text>
       </Text>
+      {cost ? (
+        <Text wrap="truncate-end">
+          <Text color="yellow">{`${cost.complete ? '' : '~'}${formatCost(cost.dollars)}`}</Text>
+          <Text dimColor>{cost.dollars === 0 ? ' free' : ' est.'}</Text>
+        </Text>
+      ) : null}
       <Text dimColor wrap="truncate-end">
         {contextLine}
       </Text>

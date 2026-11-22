@@ -1,6 +1,13 @@
 import type { ToolDefinition } from '../providers/types.js';
 
-export type ApprovalDecision = 'allow' | 'allow-session' | 'deny';
+export type ApprovalDecision =
+  | 'allow'
+  | 'allow-session'
+  | 'deny'
+  /** Allow and remember a pattern in .kiro/permissions.json. */
+  | 'allow-rule'
+  /** Deny and remember the exact subject as a rule, so it is refused again. */
+  | 'deny-rule';
 
 export interface ApprovalRequest {
   tool: string;
@@ -9,6 +16,13 @@ export interface ApprovalRequest {
   /** Full detail for the preview: a diff for file writes, the command for shell. */
   detail?: string;
   warning?: string;
+  /**
+   * What a saved rule matches: the command text, or the workspace-relative path.
+   * Absent means the request can never be auto-approved by a rule.
+   */
+  subject?: string;
+  /** False when the change escapes the workspace; rules must not pre-approve it. */
+  insideWorkspace?: boolean;
 }
 
 export type ApproveFn = (request: ApprovalRequest) => Promise<ApprovalDecision>;
@@ -45,6 +59,11 @@ export interface ToolContext {
   approve: ApproveFn;
   /** Undefined outside the TUI: headless runs cannot answer questions. */
   askUser?: AskUserFn;
+  /**
+   * Live output for a running tool (only `run_command` uses it). The UI draws
+   * the last line; headless mode ignores it.
+   */
+  onOutput?: (update: { tool: string; chunk: string; tail: string }) => void;
 }
 
 export type ToolStatus = 'ok' | 'error' | 'denied';
@@ -62,6 +81,8 @@ export interface Tool {
   /** Read-only tools never mutate state and may run in parallel. */
   readOnly?: boolean;
   run(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
+  /** True for tools added by an MCP server; they are never auto-approved. */
+  mcp?: boolean;
 }
 
 export async function requestApproval(

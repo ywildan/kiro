@@ -22,6 +22,8 @@ interface StatusBarProps {
   cwd: string;
   activity: Activity;
   toolName?: string;
+  /** Newest output line of the running command, shown instead of a bare spinner. */
+  liveTail?: string | null;
   /** When the current turn started; drives the live elapsed counter. */
   busySince?: number;
   /** Number of messages typed during a turn, waiting to run. */
@@ -50,6 +52,7 @@ export function StatusBar({
   cwd,
   activity,
   toolName,
+  liveTail,
   busySince,
   queued,
   yolo = false,
@@ -102,7 +105,11 @@ export function StatusBar({
   const badgeWidth = badge === '' ? 0 : displayWidth(badge) + 2;
   // The bar is indented to line up with the chat text, so budgets use the inner width.
   const innerWidth = Math.max(10, width - 2);
-  const state = `${spinner}${queueNote}${stateText}${elapsedNote}`;
+  // While a command runs, its newest output line says more than "running…".
+  const liveLine = activity === 'running' && liveTail ? liveTail.trim() : '';
+  const state = liveLine
+    ? `${spinner}${liveLine}${elapsedNote}`
+    : `${spinner}${queueNote}${stateText}${elapsedNote}`;
   const stateBudget = Math.max(4, Math.max(10, Math.floor(innerWidth / 2)) - badgeWidth);
   const stateShown = truncateToWidth(state, stateBudget);
   const restBudget = Math.max(0, innerWidth - badgeWidth - displayWidth(stateShown) - 2 - 6);
